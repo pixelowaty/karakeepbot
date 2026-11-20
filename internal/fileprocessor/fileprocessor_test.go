@@ -16,6 +16,7 @@ func TestProcessor_Process(t *testing.T) {
 	var (
 		pngData  = []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82}
 		webpData = []byte{'R', 'I', 'F', 'F', 0x00, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P'}
+		pdfData  = []byte("%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Size 1/Root 1 0 R>>\nstartxref\n9\n%%EOF")
 		textData = []byte("this is not a valid image file")
 	)
 
@@ -26,6 +27,8 @@ func TestProcessor_Process(t *testing.T) {
 			_, _ = w.Write(pngData)
 		case "/valid.webp":
 			_, _ = w.Write(webpData)
+		case "/valid.pdf":
+			_, _ = w.Write(pdfData)
 		case "/invalid.txt":
 			_, _ = w.Write(textData)
 		case "/too-large":
@@ -76,18 +79,42 @@ func TestProcessor_Process(t *testing.T) {
 			expectedError: nil,
 		},
 		{
+			name:          "Success with valid PDF and validator",
+			config:        config.FileProcessorConfig{Maxsize: 100, Timeout: 5},
+			urlPath:       "/valid.pdf",
+			validator:     filevalidator.PDFValidator,
+			expectError:   false,
+			expectedError: nil,
+		},
+		{
 			name:          "Fail on file too large",
 			config:        config.FileProcessorConfig{Maxsize: 100, Timeout: 5},
 			urlPath:       "/too-large",
 			validator:     nil,
 			expectError:   true,
-			expectedError: ErrValidationFailed,
+			expectedError: ErrMaxsizeExceeded,
+		},
+		{
+			name:          "Fail on PDF file too large",
+			config:        config.FileProcessorConfig{Maxsize: 100, Timeout: 5},
+			urlPath:       "/too-large",
+			validator:     filevalidator.PDFValidator,
+			expectError:   true,
+			expectedError: ErrMaxsizeExceeded,
 		},
 		{
 			name:          "Fail on validation error with text file",
 			config:        config.FileProcessorConfig{Maxsize: 200, Timeout: 5},
 			urlPath:       "/invalid.txt",
 			validator:     filevalidator.ImageValidator,
+			expectError:   true,
+			expectedError: ErrValidationFailed,
+		},
+		{
+			name:          "Fail on PDF validation error with text file",
+			config:        config.FileProcessorConfig{Maxsize: 200, Timeout: 5},
+			urlPath:       "/invalid.txt",
+			validator:     filevalidator.PDFValidator,
 			expectError:   true,
 			expectedError: ErrValidationFailed,
 		},

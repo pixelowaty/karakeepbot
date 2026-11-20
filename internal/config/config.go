@@ -96,6 +96,8 @@ var DefaultConfig = Config{
 			"image/jpeg",
 			"image/png",
 			"image/webp",
+			// Supported Document Assets
+			"application/pdf",
 		},
 		Timeout: 30, // In seconds
 	},

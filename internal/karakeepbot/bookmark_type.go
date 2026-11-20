@@ -13,6 +13,8 @@ type AssetType string
 const (
 	// ImageAssetType represents an image asset.
 	ImageAssetType AssetType = "image"
+	// PDFAssetType represents a PDF document asset.
+	PDFAssetType AssetType = "pdf"
 )
 
 // BookmarkType is an interface that represents any type of bookmark.

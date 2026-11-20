@@ -20,6 +20,7 @@ var (
 	ErrValidationFailed = errors.New("file validation failed")
 	ErrDownloadFailed   = errors.New("failed to download file")
 	ErrProcessingFailed = errors.New("failed to process file")
+	ErrMaxsizeExceeded  = errors.New("file exceeds maximum size")
 )
 
 // Validator is a function type that defines a validation strategy for a file.
@@ -116,7 +117,7 @@ func (p *Processor) Process(fileURL string, validator Validator) (path string, c
 
 	// Check if the file was larger than the limit
 	if bytesWritten > p.maxsize {
-		return "", "", fmt.Errorf("%w: exceeds %d bytes", ErrValidationFailed, p.maxsize)
+		return "", "", fmt.Errorf("%w: %d bytes > %d bytes", ErrMaxsizeExceeded, bytesWritten, p.maxsize)
 	}
 
 	// Run validation if a validator function is provided.

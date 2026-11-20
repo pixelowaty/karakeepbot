@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ type KarakeepBot struct {
 	logger         *logging.Logger
 	fileProcessor  *fileprocessor.Processor
 	fileValidators map[string]fileprocessor.Validator
+	maxFilesize    int64
 	allowlist      []int64
 	threads        []int
 	waitInterval   int
@@ -53,6 +55,7 @@ func New(logger *logging.Logger, config *config.Config) *KarakeepBot {
 	fileValidators["image/jpeg"] = filevalidator.ImageValidator
 	fileValidators["image/png"] = filevalidator.ImageValidator
 	fileValidators["image/webp"] = filevalidator.ImageValidator
+	fileValidators["application/pdf"] = filevalidator.PDFValidator
 
 	// Check if the validators passed in the configuration are supported
 	if len(config.FileProcessor.Mimetypes) > 0 {
@@ -71,6 +74,7 @@ func New(logger *logging.Logger, config *config.Config) *KarakeepBot {
 		waitInterval:   config.Karakeep.Interval,
 		fileProcessor:  fileProcessor,
 		fileValidators: fileValidators,
+		maxFilesize:    config.FileProcessor.Maxsize,
 		logger:         logger,
 	}
 }
@@ -156,6 +160,16 @@ func (kb KarakeepBot) handler(ctx context.Context, _ *Bot, update *TelegramUpdat
 			kb.logger.Error("Failed to send photo with caption", msg.AttrsWithError(err)...)
 			return
 		}
+	} else if msg.Document != nil {
+		// Add hashtags
+		caption := msg.Caption + "\n\n" + hashtags
+
+		// Send back the original document with hashtags as caption
+		kb.logger.Debug("Sending updated message with document and hashtags", msg.Attrs()...)
+		if err := kb.telegram.SendDocumentWithCaption(ctx, &msg, msg.Document.FileID, caption); err != nil {
+			kb.logger.Error("Failed to send document with caption", msg.AttrsWithError(err)...)
+			return
+		}
 	} else {
 		// Add hashtags
 		msg.Text = msg.Text + "\n\n" + hashtags
@@ -230,6 +244,10 @@ func (kb *KarakeepBot) waitForTagCompletion(ctx context.Context, bookmark *Karak
 func (kb KarakeepBot) parseMessage(ctx context.Context, msg TelegramMessage) (BookmarkType, error) {
 	if msg.Photo != nil {
 		return kb.handlePhotoMessage(ctx, msg)
+	}
+
+	if msg.Document != nil {
+		return kb.handleDocumentMessage(ctx, msg)
 	}
 
 	if url := msg.ChannelPostLink(); url != "" {
@@ -376,6 +394,98 @@ func (kb *KarakeepBot) handlePhotoMessage(ctx context.Context, msg TelegramMessa
 	// Get note from caption and append Telegram origin context
 	note := strings.TrimSpace(msg.Caption)
 	ab := NewAssetBookmark(asset.AssetId, ImageAssetType, note)
+	if ctxNote := msg.ContextNote(); ctxNote != "" {
+		if ab.Note != "" {
+			ab.Note += "\n\n" + ctxNote
+		} else {
+			ab.Note = ctxNote
+		}
+	}
+	return ab, nil
+}
+
+// handleDocumentMessage processes a message containing a document. Only PDF
+// documents are supported.
+func (kb *KarakeepBot) handleDocumentMessage(ctx context.Context, msg TelegramMessage) (bookmark BookmarkType, err error) {
+	doc := msg.Document
+	kb.logger.Debug("Handling Telegram document", "file_id", doc.FileID, "file_name", doc.FileName, "file_size", doc.FileSize, "mime_type", doc.MimeType)
+
+	// Check if the declared document type is supported.
+	validator, ok := kb.fileValidators[doc.MimeType]
+	if !ok {
+		kb.logger.Warn("Unsupported document type", append(msg.Attrs(), "mime_type", doc.MimeType)...)
+		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Unsupported document type. Only PDF documents are supported."); replyErr != nil {
+			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
+		}
+		return nil, fmt.Errorf("unsupported document type: %s", doc.MimeType)
+	}
+
+	// Check the declared file size before downloading.
+	if doc.FileSize > kb.maxFilesize {
+		kb.logger.Warn("Document exceeds the maximum file size", append(msg.Attrs(), "file_size", doc.FileSize, "max_size", kb.maxFilesize)...)
+		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Document exceeds the maximum file size"); replyErr != nil {
+			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
+		}
+		return nil, fmt.Errorf("document exceeds the maximum file size: %d bytes", doc.FileSize)
+	}
+
+	// Get file URL
+	fileURL, err := kb.telegram.GetFileURL(ctx, doc.FileID)
+	if err != nil {
+		kb.logger.Error("Failed to get file URL", msg.AttrsWithError(err)...)
+		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Failed to process document from Telegram servers, try again later"); replyErr != nil {
+			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
+		}
+		return nil, errors.New("couldn't get file URL")
+	}
+
+	// Download file and validate its content.
+	filePath, mimeType, err := kb.fileProcessor.Process(fileURL, validator)
+	if err != nil {
+		kb.logger.Error("Failed to process document", msg.AttrsWithError(err)...)
+		reply := "⚠️ Failed to process document"
+		if errors.Is(err, fileprocessor.ErrMaxsizeExceeded) {
+			reply = "⚠️ Document exceeds the maximum file size"
+		} else if errors.Is(err, fileprocessor.ErrValidationFailed) {
+			reply = "⚠️ Document is not a valid PDF file"
+		}
+		if replyErr := kb.telegram.SendReply(ctx, &msg, reply); replyErr != nil {
+			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
+		}
+		return nil, fmt.Errorf("couldn't process document: %w", err)
+	}
+	defer func() {
+		if cleanupErr := kb.fileProcessor.Cleanup(filePath); cleanupErr != nil {
+			kb.logger.Error("Failed to cleanup temporary file", "path", filePath, "error", cleanupErr)
+			if err == nil {
+				err = cleanupErr
+			}
+		}
+	}()
+
+	kb.logger.Debug("Detected MIME type", "mime_type", mimeType)
+
+	// Preserve the original file name where possible.
+	fileName := filepath.Base(doc.FileName)
+	if fileName == "." || fileName == "/" || strings.TrimSpace(fileName) == "" {
+		fileName = "document.pdf"
+	}
+
+	// Upload asset to Karakeep
+	asset, err := kb.karakeep.CreateAssetWithFileName(ctx, filePath, fileName, mimeType)
+	if err != nil {
+		kb.logger.Error("Failed to upload asset", msg.AttrsWithError(err)...)
+		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Failed to upload asset to Karakeep"); replyErr != nil {
+			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
+		}
+		return nil, errors.New("couldn't upload asset")
+	}
+
+	kb.logger.Debug("Asset uploaded successfully", "asset_id", asset.AssetId, "file_name", fileName)
+
+	// Get note from caption and append Telegram origin context
+	note := strings.TrimSpace(msg.Caption)
+	ab := NewAssetBookmark(asset.AssetId, PDFAssetType, note)
 	if ctxNote := msg.ContextNote(); ctxNote != "" {
 		if ab.Note != "" {
 			ab.Note += "\n\n" + ctxNote

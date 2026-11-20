@@ -84,6 +84,22 @@ func (t *Telegram) SendPhotoWithCaption(ctx context.Context, msg *TelegramMessag
 	return nil
 }
 
+// SendDocumentWithCaption sends a document with a caption.
+func (t *Telegram) SendDocumentWithCaption(ctx context.Context, msg *TelegramMessage, documentID string, caption string) error {
+	params := &tgbotapi.SendDocumentParams{
+		ChatID:          msg.Chat.ID,
+		MessageThreadID: msg.MessageThreadID,
+		Document:        &models.InputFileString{Data: documentID},
+		Caption:         caption,
+	}
+
+	if _, err := t.SendDocument(ctx, params); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // SendReply sends a reply to a specific message.
 func (t Telegram) SendReply(ctx context.Context, msg *TelegramMessage, text string) error {
 	params := &tgbotapi.SendMessageParams{
@@ -120,5 +136,5 @@ func (t Telegram) GetFileURL(ctx context.Context, fileID string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", t.token.Value(), file.FilePath), nil
+	return t.FileDownloadLink(file), nil
 }

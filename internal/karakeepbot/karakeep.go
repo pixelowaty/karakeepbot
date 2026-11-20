@@ -94,8 +94,22 @@ func (k Karakeep) RetrieveBookmarkById(ctx context.Context, id string) (*Karakee
 }
 
 // CreateAsset uploads a file to Karakeep and returns the asset details.
+// The asset file name is derived from the file path.
 // This version streams the request body, which is more memory-efficient and robust.
 func (k Karakeep) CreateAsset(ctx context.Context, filePath string, mimeType string) (*KarakeepAsset, error) {
+	return k.createAsset(ctx, filePath, filepath.Base(filePath), mimeType)
+}
+
+// CreateAssetWithFileName is like CreateAsset but uses the provided file name
+// instead of deriving it from the file path.
+func (k Karakeep) CreateAssetWithFileName(ctx context.Context, filePath, fileName, mimeType string) (*KarakeepAsset, error) {
+	return k.createAsset(ctx, filePath, fileName, mimeType)
+}
+
+// createAsset uploads a file to Karakeep with the given file name and returns
+// the asset details.
+// This version streams the request body, which is more memory-efficient and robust.
+func (k Karakeep) createAsset(ctx context.Context, filePath, fileName, mimeType string) (*KarakeepAsset, error) {
 	pipeReader, pipeWriter := io.Pipe()
 	writer := multipart.NewWriter(pipeWriter)
 	errChan := make(chan error, 1)
@@ -134,7 +148,6 @@ func (k Karakeep) CreateAsset(ctx context.Context, filePath string, mimeType str
 				}
 			}()
 
-			fileName := filepath.Base(filePath)
 			part, err := writer.CreatePart(textproto.MIMEHeader{
 				"Content-Disposition": []string{fmt.Sprintf(`form-data; name="file"; filename="%s"`, fileName)},
 				"Content-Type":        []string{mimeType},
