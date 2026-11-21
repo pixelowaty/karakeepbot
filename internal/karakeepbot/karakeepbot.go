@@ -404,21 +404,41 @@ func (kb *KarakeepBot) handlePhotoMessage(ctx context.Context, msg TelegramMessa
 	return ab, nil
 }
 
+// sanitizeFileName derives a safe base file name from the provided name. It
+// strips directory components, replaces characters that are unsafe in a
+// multipart header, and falls back to "document.pdf" when no usable name
+// remains.
+func sanitizeFileName(name string) string {
+	fileName := strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || r < 0x20 || r == 0x7f {
+			return '_'
+		}
+		return r
+	}, name)
+
+	fileName = filepath.Base(fileName)
+	if fileName == "." || fileName == ".." || fileName == "/" || strings.TrimSpace(fileName) == "" {
+		return "document.pdf"
+	}
+	return fileName
+}
+
 // handleDocumentMessage processes a message containing a document. Only PDF
 // documents are supported.
 func (kb *KarakeepBot) handleDocumentMessage(ctx context.Context, msg TelegramMessage) (bookmark BookmarkType, err error) {
 	doc := msg.Document
 	kb.logger.Debug("Handling Telegram document", "file_id", doc.FileID, "file_name", doc.FileName, "file_size", doc.FileSize, "mime_type", doc.MimeType)
 
-	// Check if the declared document type is supported.
-	validator, ok := kb.fileValidators[doc.MimeType]
-	if !ok {
+	// Only PDF documents are supported.
+	if doc.MimeType != "application/pdf" {
 		kb.logger.Warn("Unsupported document type", append(msg.Attrs(), "mime_type", doc.MimeType)...)
 		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Unsupported document type. Only PDF documents are supported."); replyErr != nil {
 			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
 		}
 		return nil, fmt.Errorf("unsupported document type: %s", doc.MimeType)
 	}
+
+	validator := kb.fileValidators["application/pdf"]
 
 	// Check the declared file size before downloading.
 	if doc.FileSize > kb.maxFilesize {
@@ -466,10 +486,7 @@ func (kb *KarakeepBot) handleDocumentMessage(ctx context.Context, msg TelegramMe
 	kb.logger.Debug("Detected MIME type", "mime_type", mimeType)
 
 	// Preserve the original file name where possible.
-	fileName := filepath.Base(doc.FileName)
-	if fileName == "." || fileName == "/" || strings.TrimSpace(fileName) == "" {
-		fileName = "document.pdf"
-	}
+	fileName := sanitizeFileName(doc.FileName)
 
 	// Upload asset to Karakeep
 	asset, err := kb.karakeep.CreateAssetWithFileName(ctx, filePath, fileName, mimeType)
