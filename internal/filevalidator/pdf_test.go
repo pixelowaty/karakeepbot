@@ -76,7 +76,7 @@ func TestPDFValidator(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to open test file: %v", err)
 			}
-			defer file.Close()
+			defer func() { _ = file.Close() }()
 
 			mimeType, err := PDFValidator(file)
 
@@ -111,7 +111,7 @@ func TestPDFValidator_SeeksToStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open test file: %v", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Move the file offset away from the start.
 	if _, err := file.Seek(1, 0); err != nil {
