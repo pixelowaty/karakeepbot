@@ -193,21 +193,31 @@ func (k Karakeep) createAsset(ctx context.Context, filePath, fileName, mimeType 
 }
 
 // UpdateBookmarkTitle sets the bookmark title via PATCH /api/v1/bookmarks/{id}.
-// The current Summary is passed alongside the new Title because the generated
-// request struct lacks omitempty on Summary and would otherwise serialize
-// "summary": null, erasing the AI-generated summary.
+// It sends a minimal payload containing only the title. The generated
+// karakeep.PatchBookmarksBookmarkIdJSONBody struct lacks omitempty on its
+// pointer fields (CreatedAt, Text, AssetContent, Author, Summary, ...), so
+// using it would serialize explicit null values that Karakeep's backend Zod
+// validation rejects with 400 Bad Request.
 func (k Karakeep) UpdateBookmarkTitle(ctx context.Context, bookmark *KarakeepBookmark, title string) error {
-	body := karakeep.PatchBookmarksBookmarkIdJSONRequestBody{
-		Title:   &title,
-		Summary: bookmark.Summary,
+	payload, err := json.Marshal(struct {
+		Title string `json:"title"`
+	}{Title: title})
+	if err != nil {
+		return fmt.Errorf("failed to marshal title payload: %w", err)
 	}
 
-	response, err := k.PatchBookmarksBookmarkIdWithResponse(ctx, bookmark.Id, body)
+	resp, err := k.PatchBookmarksBookmarkIdWithBody(ctx, bookmark.Id, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("failed to update bookmark title: %w", err)
 	}
-	if response.StatusCode() != http.StatusOK {
-		return fmt.Errorf("failed to update bookmark title, received HTTP status: %s", response.Status())
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("failed to update bookmark title, received HTTP status: %s (failed to read response body: %w)", resp.Status, readErr)
+		}
+		return fmt.Errorf("failed to update bookmark title, received HTTP status: %s, body: %s", resp.Status, string(body))
 	}
 
 	return nil

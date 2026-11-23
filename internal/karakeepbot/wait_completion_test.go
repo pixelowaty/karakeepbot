@@ -756,8 +756,8 @@ func TestContinueWaitForTags_WithEditMessageText(t *testing.T) {
 }
 
 // TestUpdateBookmarkTitle_FromSummary verifies that UpdateBookmarkTitle sends a
-// PATCH with both the new title and the existing summary (summary must be
-// preserved, not nulled).
+// minimal PATCH payload containing only the title, without serializing explicit
+// null values for other fields (which Karakeep's Zod validation rejects).
 func TestUpdateBookmarkTitle_FromSummary(t *testing.T) {
 	t.Parallel()
 
@@ -783,30 +783,28 @@ func TestUpdateBookmarkTitle_FromSummary(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify the PATCH payload preserved the summary alongside the title.
+	// Verify the PATCH payload was recorded.
 	body, ok := tagSrv.patchCall("bm-title-1")
 	if !ok {
 		t.Fatal("expected a PATCH call to be recorded")
 	}
 
+	// The payload must contain a non-null title.
 	var title string
-	if raw, ok := body["title"]; !ok || string(raw) == "null" {
+	rawTitle, hasTitle := body["title"]
+	if !hasTitle || string(rawTitle) == "null" {
 		t.Error("expected a non-null title in PATCH payload")
 	} else {
-		_ = json.Unmarshal(raw, &title)
+		_ = json.Unmarshal(rawTitle, &title)
 		if title != newTitle {
 			t.Errorf("expected title %q, got %q", newTitle, title)
 		}
 	}
 
-	// Summary must be preserved (not null).
-	if raw, ok := body["summary"]; !ok || string(raw) == "null" {
-		t.Error("expected summary to be preserved (non-null) in PATCH payload")
-	} else {
-		var gotSummary string
-		_ = json.Unmarshal(raw, &gotSummary)
-		if gotSummary != summary {
-			t.Errorf("expected summary %q, got %q", summary, gotSummary)
+	// The payload must NOT send explicit null values for other fields.
+	for _, field := range []string{"createdAt", "summary", "text", "assetContent", "author"} {
+		if raw, present := body[field]; present && string(raw) == "null" {
+			t.Errorf("PATCH payload must not send %q: null, got %s", field, string(raw))
 		}
 	}
 }
