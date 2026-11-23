@@ -44,6 +44,20 @@ type telegramMock struct {
 
 	// Records the last sendDocument call, if any.
 	sentDocument *sentDocument
+
+	// Records all editMessageCaption and editMessageText calls.
+	editCaptures []editCapture
+}
+
+// editCapture stores the parameters of an editMessageCaption or
+// editMessageText call. For editMessageCaption, caption is set; for
+// editMessageText, text is set.
+type editCapture struct {
+	chatID    int64
+	messageID int
+	caption   string
+	text      string
+	isText    bool
 }
 
 // sentDocument captures the fields of a sendDocument API call.
@@ -130,6 +144,67 @@ func (m *telegramMock) handle(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
 			return
 
+		case "editMessageCaption":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var editChatID int64
+			if v := r.FormValue("chat_id"); v != "" {
+				if _, scanErr := fmt.Sscanf(v, "%d", &editChatID); scanErr != nil {
+					http.Error(w, "invalid chat_id: "+scanErr.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			var editMessageID int
+			if v := r.FormValue("message_id"); v != "" {
+				if _, scanErr := fmt.Sscanf(v, "%d", &editMessageID); scanErr != nil {
+					http.Error(w, "invalid message_id: "+scanErr.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			editCaption := r.FormValue("caption")
+			m.mu.Lock()
+			m.editCaptures = append(m.editCaptures, editCapture{
+				chatID:    editChatID,
+				messageID: editMessageID,
+				caption:   editCaption,
+			})
+			m.mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":42}}`))
+			return
+
+		case "editMessageText":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var editChatID int64
+			if v := r.FormValue("chat_id"); v != "" {
+				if _, scanErr := fmt.Sscanf(v, "%d", &editChatID); scanErr != nil {
+					http.Error(w, "invalid chat_id: "+scanErr.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			var editMessageID int
+			if v := r.FormValue("message_id"); v != "" {
+				if _, scanErr := fmt.Sscanf(v, "%d", &editMessageID); scanErr != nil {
+					http.Error(w, "invalid message_id: "+scanErr.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			editText := r.FormValue("text")
+			m.mu.Lock()
+			m.editCaptures = append(m.editCaptures, editCapture{
+				chatID:    editChatID,
+				messageID: editMessageID,
+				text:      editText,
+				isText:    true,
+			})
+			m.mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":42}}`))
+			return
+
 		default:
 			_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
 		}
@@ -180,6 +255,16 @@ func (m *telegramMock) document() *sentDocument {
 		caption:         m.sentDocument.caption,
 		document:        m.sentDocument.document,
 	}
+}
+
+// edits returns a copy of all editMessageCaption captures.
+func (m *telegramMock) edits() []editCapture {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	result := make([]editCapture, len(m.editCaptures))
+	copy(result, m.editCaptures)
+	return result
 }
 
 // karakeepMock is a fake Karakeep API server. It receives the multipart asset
@@ -915,7 +1000,8 @@ func TestHandlePhotoMessage_SizeExceeded(t *testing.T) {
 }
 
 // TestSendDocumentWithCaption verifies that SendDocumentWithCaption sends the
-// document to the correct chat and thread with the given caption.
+// document to the correct chat and thread with the given caption and returns
+// the new message ID.
 func TestSendDocumentWithCaption(t *testing.T) {
 	t.Parallel()
 
@@ -938,8 +1024,12 @@ func TestSendDocumentWithCaption(t *testing.T) {
 		},
 	}
 
-	if err := kb.telegram.SendDocumentWithCaption(context.Background(), &msg, msg.Document.FileID, "my caption\n\n#golang #pdf"); err != nil {
+	msgID, err := kb.telegram.SendDocumentWithCaption(context.Background(), &msg, msg.Document.FileID, "my caption\n\n#golang #pdf")
+	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
+	}
+	if msgID != 1 {
+		t.Errorf("expected message ID 1, got %d", msgID)
 	}
 
 	sent := tg.document()

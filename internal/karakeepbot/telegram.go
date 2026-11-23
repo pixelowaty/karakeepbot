@@ -53,23 +53,26 @@ func createTelegram(logger *logging.Logger, config *config.TelegramConfig) *Tele
 	return &Telegram{Bot: telegramBot, token: config.Token}
 }
 
-// SendNewMessage sends a new message to the user's chat.
-func (t Telegram) SendNewMessage(ctx context.Context, msg *TelegramMessage) error {
+// SendNewMessage sends a new message to the user's chat. Returns the ID of
+// the newly created message, or 0 on error.
+func (t Telegram) SendNewMessage(ctx context.Context, msg *TelegramMessage) (int, error) {
 	params := &tgbotapi.SendMessageParams{
 		ChatID:          msg.Chat.ID,
 		MessageThreadID: msg.MessageThreadID,
 		Text:            msg.Text,
 	}
 
-	if _, err := t.SendMessage(ctx, params); err != nil {
-		return err
+	resp, err := t.SendMessage(ctx, params)
+	if err != nil {
+		return 0, err
 	}
 
-	return nil
+	return resp.ID, nil
 }
 
-// SendPhotoWithCaption sends a photo with a caption.
-func (t *Telegram) SendPhotoWithCaption(ctx context.Context, msg *TelegramMessage, photoID string, caption string) error {
+// SendPhotoWithCaption sends a photo with a caption. Returns the ID of the
+// newly created message, or 0 on error.
+func (t *Telegram) SendPhotoWithCaption(ctx context.Context, msg *TelegramMessage, photoID string, caption string) (int, error) {
 	params := &tgbotapi.SendPhotoParams{
 		ChatID:          msg.Chat.ID,
 		MessageThreadID: msg.MessageThreadID,
@@ -77,15 +80,17 @@ func (t *Telegram) SendPhotoWithCaption(ctx context.Context, msg *TelegramMessag
 		Caption:         caption,
 	}
 
-	if _, err := t.SendPhoto(ctx, params); err != nil {
-		return err
+	resp, err := t.SendPhoto(ctx, params)
+	if err != nil {
+		return 0, err
 	}
 
-	return nil
+	return resp.ID, nil
 }
 
-// SendDocumentWithCaption sends a document with a caption.
-func (t *Telegram) SendDocumentWithCaption(ctx context.Context, msg *TelegramMessage, documentID string, caption string) error {
+// SendDocumentWithCaption sends a document with a caption. Returns the ID of
+// the newly created message, or 0 on error.
+func (t *Telegram) SendDocumentWithCaption(ctx context.Context, msg *TelegramMessage, documentID string, caption string) (int, error) {
 	params := &tgbotapi.SendDocumentParams{
 		ChatID:          msg.Chat.ID,
 		MessageThreadID: msg.MessageThreadID,
@@ -93,11 +98,12 @@ func (t *Telegram) SendDocumentWithCaption(ctx context.Context, msg *TelegramMes
 		Caption:         caption,
 	}
 
-	if _, err := t.SendDocument(ctx, params); err != nil {
-		return err
+	resp, err := t.SendDocument(ctx, params)
+	if err != nil {
+		return 0, err
 	}
 
-	return nil
+	return resp.ID, nil
 }
 
 // SendReply sends a reply to a specific message.
@@ -110,6 +116,36 @@ func (t Telegram) SendReply(ctx context.Context, msg *TelegramMessage, text stri
 	}
 
 	if _, err := t.SendMessage(ctx, params); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// EditMessageCaption edits the caption of an existing message.
+func (t Telegram) EditMessageCaption(ctx context.Context, chatID int64, messageID int, caption string) error {
+	params := &tgbotapi.EditMessageCaptionParams{
+		ChatID:    chatID,
+		MessageID: messageID,
+		Caption:   caption,
+	}
+
+	if _, err := t.Bot.EditMessageCaption(ctx, params); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// EditMessageText edits the text of an existing plain text message.
+func (t Telegram) EditMessageText(ctx context.Context, chatID int64, messageID int, text string) error {
+	params := &tgbotapi.EditMessageTextParams{
+		ChatID:    chatID,
+		MessageID: messageID,
+		Text:      text,
+	}
+
+	if _, err := t.Bot.EditMessageText(ctx, params); err != nil {
 		return err
 	}
 

@@ -192,6 +192,27 @@ func (k Karakeep) createAsset(ctx context.Context, filePath, fileName, mimeType 
 	return &asset, nil
 }
 
+// UpdateBookmarkTitle sets the bookmark title via PATCH /api/v1/bookmarks/{id}.
+// The current Summary is passed alongside the new Title because the generated
+// request struct lacks omitempty on Summary and would otherwise serialize
+// "summary": null, erasing the AI-generated summary.
+func (k Karakeep) UpdateBookmarkTitle(ctx context.Context, bookmark *KarakeepBookmark, title string) error {
+	body := karakeep.PatchBookmarksBookmarkIdJSONRequestBody{
+		Title:   &title,
+		Summary: bookmark.Summary,
+	}
+
+	response, err := k.PatchBookmarksBookmarkIdWithResponse(ctx, bookmark.Id, body)
+	if err != nil {
+		return fmt.Errorf("failed to update bookmark title: %w", err)
+	}
+	if response.StatusCode() != http.StatusOK {
+		return fmt.Errorf("failed to update bookmark title, received HTTP status: %s", response.Status())
+	}
+
+	return nil
+}
+
 // AddTags attaches human-attached tags to an existing bookmark.
 func (k Karakeep) AddTags(ctx context.Context, bookmarkID string, tagNames []string) error {
 	if len(tagNames) == 0 {

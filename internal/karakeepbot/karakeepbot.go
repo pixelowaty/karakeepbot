@@ -140,14 +140,19 @@ func (kb KarakeepBot) handler(ctx context.Context, _ *Bot, update *TelegramUpdat
 	// Wait until bookmark tags are updated (with a timeout to avoid hanging on
 	// uncrawlable URLs)
 	kb.logger.Debug("Waiting for bookmark tags to be updated", bookmark.Attrs()...)
-	bookmark, err = kb.waitForTagCompletion(ctx, bookmark)
+	result, err := kb.waitForTagCompletion(ctx, bookmark)
 	if err != nil {
 		kb.logger.Error("Failed to wait for bookmark tagging", "error", err)
 		return
 	}
 
-	// Get hashtags
+	bookmark = result.Bookmark
 	hashtags := bookmark.Hashtags()
+	var newMessageID int
+	// isMedia is true when the sent message is a photo/document with a
+	// caption (edited via editMessageCaption); false for plain text/URL
+	// messages (edited via editMessageText).
+	isMedia := false
 
 	// Send back with hashtags
 	if msg.Photo != nil {
@@ -156,30 +161,77 @@ func (kb KarakeepBot) handler(ctx context.Context, _ *Bot, update *TelegramUpdat
 
 		// Send back the original photo with hashtags as caption
 		kb.logger.Debug("Sending updated message with photo and hashtags", msg.Attrs()...)
-		if err := kb.telegram.SendPhotoWithCaption(ctx, &msg, msg.Photo[len(msg.Photo)-1].FileID, caption); err != nil {
+		newMessageID, err = kb.telegram.SendPhotoWithCaption(ctx, &msg, msg.Photo[len(msg.Photo)-1].FileID, caption)
+		if err != nil {
 			kb.logger.Error("Failed to send photo with caption", msg.AttrsWithError(err)...)
 			return
 		}
+		isMedia = true
 	} else if msg.Document != nil {
 		// Add hashtags
 		caption := msg.Caption + "\n\n" + hashtags
 
 		// Send back the original document with hashtags as caption
 		kb.logger.Debug("Sending updated message with document and hashtags", msg.Attrs()...)
-		if err := kb.telegram.SendDocumentWithCaption(ctx, &msg, msg.Document.FileID, caption); err != nil {
+		newMessageID, err = kb.telegram.SendDocumentWithCaption(ctx, &msg, msg.Document.FileID, caption)
+		if err != nil {
 			kb.logger.Error("Failed to send document with caption", msg.AttrsWithError(err)...)
 			return
 		}
+		isMedia = true
 	} else {
 		// Add hashtags
 		msg.Text = msg.Text + "\n\n" + hashtags
 
 		// Send back new message with hashtags
 		kb.logger.Debug("Sending updated message with hashtags", msg.Attrs()...)
-		if err := kb.telegram.SendNewMessage(ctx, &msg); err != nil {
+		newMessageID, err = kb.telegram.SendNewMessage(ctx, &msg)
+		if err != nil {
 			kb.logger.Error("Failed to send new message", msg.AttrsWithError(err)...)
 			return
 		}
+	}
+
+	// If tags appeared after the initial timeout, continue polling in the
+	// background and update the Telegram message once they arrive.
+	if result.TagsUpdatedAfterTimeout && newMessageID > 0 {
+		kb.ContinueWaitForTags(ctx, bookmark, func(updated *KarakeepBookmark) {
+			// Derive a background context so the edit and title update are not
+			// aborted when the handler's context is cancelled.
+			bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			// Update the Telegram message with the new tags, skipping no-op
+			// edits (Telegram rejects edits that do not change the content).
+			updatedHashtags := updated.Hashtags()
+			if updatedHashtags != "" && updatedHashtags != hashtags {
+				if isMedia {
+					caption := msg.Caption + "\n\n" + updatedHashtags
+					if err := kb.telegram.EditMessageCaption(bgCtx, msg.Chat.ID, newMessageID, caption); err != nil {
+						kb.logger.Error("Failed to update Telegram message caption", "message_id", newMessageID, "error", err)
+					} else {
+						kb.logger.Info("Updated Telegram message caption with AI tags", "message_id", newMessageID, "tags", updatedHashtags)
+					}
+				} else {
+					text := msg.Text + "\n\n" + updatedHashtags
+					if err := kb.telegram.EditMessageText(bgCtx, msg.Chat.ID, newMessageID, text); err != nil {
+						kb.logger.Error("Failed to update Telegram message text", "message_id", newMessageID, "error", err)
+					} else {
+						kb.logger.Info("Updated Telegram message text with AI tags", "message_id", newMessageID, "tags", updatedHashtags)
+					}
+				}
+			}
+
+			// Populate an empty bookmark title from the AI summary/tags.
+			kb.ensureBookmarkTitle(bgCtx, updated)
+		})
+	} else if !bookmark.HasTitle() {
+		// Tags completed within the initial wait; populate an empty title
+		// synchronously. Use a bounded context so a stuck summarization cannot
+		// hang the handler (which otherwise uses the long-lived signal ctx).
+		titleCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		kb.ensureBookmarkTitle(titleCtx, bookmark)
+		cancel()
 	}
 
 	// Delete original message
@@ -213,9 +265,20 @@ func (kb KarakeepBot) isThreadIdAllowed(threadId int) bool {
 	return len(kb.threads) == 0 || slices.Contains(kb.threads, threadId)
 }
 
+// TagCompletionResult holds the result of waiting for bookmark tagging to
+// complete.
+type TagCompletionResult struct {
+	// Bookmark is the bookmark with the latest available tags.
+	Bookmark *KarakeepBookmark
+	// TagsUpdatedAfterTimeout indicates whether new tags appeared after the
+	// initial timeout, meaning the Telegram message should be updated.
+	TagsUpdatedAfterTimeout bool
+}
+
 // waitForTagCompletion polls the bookmark tagging status until it succeeds,
-// fails, or the retry timeout is reached. Returns the updated bookmark.
-func (kb *KarakeepBot) waitForTagCompletion(ctx context.Context, bookmark *KarakeepBookmark) (*KarakeepBookmark, error) {
+// fails, or the initial retry timeout is reached. Returns a result containing
+// the bookmark and a flag indicating whether tags appeared after the timeout.
+func (kb *KarakeepBot) waitForTagCompletion(ctx context.Context, bookmark *KarakeepBookmark) (*TagCompletionResult, error) {
 	retries := 0
 	for {
 		var err error
@@ -223,19 +286,135 @@ func (kb *KarakeepBot) waitForTagCompletion(ctx context.Context, bookmark *Karak
 		if err != nil {
 			return nil, err
 		}
+		if bookmark.TaggingStatus == nil {
+			return nil, fmt.Errorf("bookmark tagging status is nil")
+		}
 		if *bookmark.TaggingStatus == karakeep.BookmarkTaggingStatusSuccess {
-			return bookmark, nil
+			return &TagCompletionResult{Bookmark: bookmark, TagsUpdatedAfterTimeout: false}, nil
 		}
 		if *bookmark.TaggingStatus == karakeep.BookmarkTaggingStatusFailure {
 			return nil, fmt.Errorf("bookmark tagging failed")
 		}
 		retries++
 		if retries >= maxTagRetries {
-			kb.logger.Warn("Bookmark tagging did not complete within timeout, proceeding anyway", bookmark.Attrs()...)
-			return bookmark, nil
+			kb.logger.Warn("Bookmark tagging did not complete within timeout, continuing in background", bookmark.Attrs()...)
+			// TagsUpdatedAfterTimeout is true so the caller starts background
+			// polling (ContinueWaitForTags) to catch tags that arrive later.
+			return &TagCompletionResult{Bookmark: bookmark, TagsUpdatedAfterTimeout: true}, nil
 		}
 		kb.logger.Debug(fmt.Sprintf("Bookmark is still pending, waiting %d seconds before retrying", kb.waitInterval), bookmark.Attrs()...)
 		time.Sleep(time.Duration(kb.waitInterval) * time.Second)
+	}
+}
+
+// ContinueWaitForTags continues polling the Karakeep API for bookmark tagging
+// completion with a longer interval (15 seconds) in case the initial wait
+// timed out. It runs in a goroutine and calls the provided callback with the
+// updated bookmark once tags are available. If tags have already completed,
+// the callback is called synchronously. Uses a separate context to avoid
+// cancellations from the parent handler.
+func (kb *KarakeepBot) ContinueWaitForTags(ctx context.Context, bookmark *KarakeepBookmark, onUpdate func(*KarakeepBookmark)) {
+	go func() {
+		// Derive a separate context so cancellation of the handler's context
+		// does not abort the background tag polling.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		// Initial delay so we do not hammer the API right after the
+		// timeout-based send.  Give Karakeep a bit more time to finish.
+		time.Sleep(15 * time.Second)
+
+		const interval = 15 * time.Second
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			updated, err := kb.karakeep.RetrieveBookmarkById(ctx, bookmark.Id)
+			if err != nil {
+				kb.logger.Error("ContinueWaitForTags: failed to retrieve bookmark", "bookmark_id", bookmark.Id, "error", err)
+				return
+			}
+
+			if updated.TaggingStatus == nil {
+				kb.logger.Error("ContinueWaitForTags: bookmark tagging status is nil", "bookmark_id", bookmark.Id)
+				return
+			}
+
+			if *updated.TaggingStatus == karakeep.BookmarkTaggingStatusFailure {
+				kb.logger.Error("ContinueWaitForTags: bookmark tagging failed", "bookmark_id", bookmark.Id)
+				return
+			}
+
+			if *updated.TaggingStatus == karakeep.BookmarkTaggingStatusSuccess && len(updated.Tags) > 0 {
+				kb.logger.Info("Tags discovered during background polling, updating Telegram message", "bookmark_id", bookmark.Id, "tags", len(updated.Tags))
+				onUpdate(updated)
+				return
+			}
+
+			kb.logger.Debug("ContinueWaitForTags: still waiting for tags", "bookmark_id", bookmark.Id)
+			time.Sleep(interval)
+		}
+	}()
+}
+
+// ensureBookmarkTitle populates an empty bookmark title from the AI summary
+// (or AI tags as fallback) via PATCH. It waits for the AI summarization to
+// finish (polling within the provided context) before computing the title, so
+// the summary is available. It is a no-op when the bookmark already has a
+// title or when no AI-derived title can be produced.
+func (kb *KarakeepBot) ensureBookmarkTitle(ctx context.Context, bookmark *KarakeepBookmark) {
+	if bookmark.HasTitle() {
+		return
+	}
+
+	// Wait for the AI summarization to finish so the summary is available.
+	updated := kb.waitForSummarization(ctx, bookmark)
+	if updated == nil {
+		return
+	}
+
+	newTitle := updated.GenerateTitleFromAI(120)
+	if newTitle == "" {
+		kb.logger.Debug("No AI-derived title available, skipping title update", updated.Attrs()...)
+		return
+	}
+
+	if err := kb.karakeep.UpdateBookmarkTitle(ctx, updated, newTitle); err != nil {
+		kb.logger.Error("Failed to update bookmark title", "bookmark_id", updated.Id, "title", newTitle, "error", err)
+		return
+	}
+
+	kb.logger.Info("Updated bookmark title from AI", "bookmark_id", updated.Id, "title", newTitle)
+}
+
+// waitForSummarization polls the bookmark until its summarization status is no
+// longer pending (or the context is done). It returns the latest bookmark,
+// or nil if the context was cancelled. The polling interval is bounded so the
+// caller's context timeout remains the effective deadline.
+func (kb *KarakeepBot) waitForSummarization(ctx context.Context, bookmark *KarakeepBookmark) *KarakeepBookmark {
+	const interval = 5 * time.Second
+
+	for {
+		if bookmark.SummarizationStatus == nil || *bookmark.SummarizationStatus != karakeep.BookmarkSummarizationStatusPending {
+			return bookmark
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
+
+		updated, err := kb.karakeep.RetrieveBookmarkById(ctx, bookmark.Id)
+		if err != nil {
+			kb.logger.Error("waitForSummarization: failed to retrieve bookmark", "bookmark_id", bookmark.Id, "error", err)
+			return nil
+		}
+		bookmark = updated
 	}
 }
 
