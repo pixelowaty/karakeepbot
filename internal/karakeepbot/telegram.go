@@ -29,21 +29,26 @@ func createTelegram(logger *logging.Logger, config *config.TelegramConfig) *Tele
 
 	var opts []tgbotapi.Option
 
+	// Configure a custom HTTP client and init timeout. The library default
+	// checkInitTimeout is only 5 seconds, which is too short for getMe in
+	// environments with slow or intermittent internet (e.g. homelabs behind
+	// VPNs). Use 30 seconds for both the HTTP client and the init check.
+	var transport *http.Transport
 	if config.ProxyEnabled {
 		proxyURL, err := url.Parse(config.ProxyURL)
 		if err != nil {
 			logger.Fatal("Error parsing proxy URL.", "error", err)
 		}
-
-		transport := &http.Transport{
+		transport = &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 		}
-		client := &http.Client{
-			Transport: transport,
-		}
-		opts = append(opts, tgbotapi.WithHTTPClient(30*time.Second, client))
-		opts = append(opts, tgbotapi.WithCheckInitTimeout(30*time.Second))
 	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+	opts = append(opts, tgbotapi.WithHTTPClient(30*time.Second, client))
+	opts = append(opts, tgbotapi.WithCheckInitTimeout(30*time.Second))
 
 	telegramBot, err := tgbotapi.New(config.Token.Value(), opts...)
 	if err != nil {
