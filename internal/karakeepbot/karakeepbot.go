@@ -363,17 +363,20 @@ func (kb *KarakeepBot) handlePhotoMessage(ctx context.Context, msg TelegramMessa
 	filePath, mimeType, err := kb.fileProcessor.Process(fileURL, nil)
 	if err != nil {
 		kb.logger.Error("Failed to process image", msg.AttrsWithError(err)...)
-		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Failed to process image"); replyErr != nil {
+		reply := "⚠️ Failed to process image"
+		if errors.Is(err, fileprocessor.ErrMaxsizeExceeded) {
+			reply = "⚠️ Image exceeds the maximum file size"
+		}
+		if replyErr := kb.telegram.SendReply(ctx, &msg, reply); replyErr != nil {
 			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
 		}
-		return nil, errors.New("couldn't process image")
+		return nil, fmt.Errorf("couldn't process image: %w", err)
 	}
 	defer func() {
 		if cleanupErr := kb.fileProcessor.Cleanup(filePath); cleanupErr != nil {
+			// A cleanup failure after a successful upload must not turn the
+			// result into an error: the file was already uploaded to Karakeep.
 			kb.logger.Error("Failed to cleanup temporary file", "path", filePath, "error", cleanupErr)
-			if err == nil {
-				err = cleanupErr
-			}
 		}
 	}()
 
@@ -423,14 +426,34 @@ func sanitizeFileName(name string) string {
 	return fileName
 }
 
+// isPDFDocument reports whether a Telegram document is plausibly a PDF. A PDF
+// MIME type always indicates a PDF. Telegram sometimes reports an empty or
+// generic (application/octet-stream) MIME type, in which case the file name
+// extension is used as a hint. A specific non-PDF MIME type is not overridden
+// by the extension, so a file is never accepted on the extension alone. The
+// file content is always validated with the PDF validator before the document
+// is processed.
+func isPDFDocument(mimeType, fileName string) bool {
+	if mimeType == "application/pdf" {
+		return true
+	}
+	switch mimeType {
+	case "", "application/octet-stream":
+		return strings.EqualFold(filepath.Ext(fileName), ".pdf")
+	}
+	return false
+}
+
 // handleDocumentMessage processes a message containing a document. Only PDF
 // documents are supported.
 func (kb *KarakeepBot) handleDocumentMessage(ctx context.Context, msg TelegramMessage) (bookmark BookmarkType, err error) {
 	doc := msg.Document
 	kb.logger.Debug("Handling Telegram document", "file_id", doc.FileID, "file_name", doc.FileName, "file_size", doc.FileSize, "mime_type", doc.MimeType)
 
-	// Only PDF documents are supported.
-	if doc.MimeType != "application/pdf" {
+	// Only PDF documents are supported. Telegram may report an empty or generic
+	// MIME type, so a PDF file name extension is also accepted; the content is
+	// always validated with the PDF validator before processing.
+	if !isPDFDocument(doc.MimeType, doc.FileName) {
 		kb.logger.Warn("Unsupported document type", append(msg.Attrs(), "mime_type", doc.MimeType)...)
 		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Unsupported document type. Only PDF documents are supported."); replyErr != nil {
 			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
@@ -476,10 +499,9 @@ func (kb *KarakeepBot) handleDocumentMessage(ctx context.Context, msg TelegramMe
 	}
 	defer func() {
 		if cleanupErr := kb.fileProcessor.Cleanup(filePath); cleanupErr != nil {
+			// A cleanup failure after a successful upload must not turn the
+			// result into an error: the file was already uploaded to Karakeep.
 			kb.logger.Error("Failed to cleanup temporary file", "path", filePath, "error", cleanupErr)
-			if err == nil {
-				err = cleanupErr
-			}
 		}
 	}()
 

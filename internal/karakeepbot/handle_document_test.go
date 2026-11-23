@@ -41,6 +41,17 @@ type telegramMock struct {
 	mu                sync.Mutex
 	getFileCallsCount int
 	sentReplies       []string
+
+	// Records the last sendDocument call, if any.
+	sentDocument *sentDocument
+}
+
+// sentDocument captures the fields of a sendDocument API call.
+type sentDocument struct {
+	chatID          int64
+	messageThreadID int
+	caption         string
+	document        string
 }
 
 func newTelegramMock(t *testing.T) *telegramMock {
@@ -87,6 +98,38 @@ func (m *telegramMock) handle(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
 			return
 
+		case "sendDocument":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			var chatID int64
+			if v := r.FormValue("chat_id"); v != "" {
+				if _, scanErr := fmt.Sscanf(v, "%d", &chatID); scanErr != nil {
+					http.Error(w, "invalid chat_id: "+scanErr.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			var threadID int
+			if v := r.FormValue("message_thread_id"); v != "" {
+				if _, scanErr := fmt.Sscanf(v, "%d", &threadID); scanErr != nil {
+					http.Error(w, "invalid message_thread_id: "+scanErr.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			doc := r.FormValue("document")
+			caption := r.FormValue("caption")
+			m.mu.Lock()
+			m.sentDocument = &sentDocument{
+				chatID:          chatID,
+				messageThreadID: threadID,
+				caption:         caption,
+				document:        doc,
+			}
+			m.mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
+			return
+
 		default:
 			_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
 		}
@@ -122,6 +165,21 @@ func (m *telegramMock) replies() []string {
 	defer m.mu.Unlock()
 
 	return append([]string(nil), m.sentReplies...)
+}
+
+func (m *telegramMock) document() *sentDocument {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.sentDocument == nil {
+		return nil
+	}
+	return &sentDocument{
+		chatID:          m.sentDocument.chatID,
+		messageThreadID: m.sentDocument.messageThreadID,
+		caption:         m.sentDocument.caption,
+		document:        m.sentDocument.document,
+	}
 }
 
 // karakeepMock is a fake Karakeep API server. It receives the multipart asset
@@ -255,6 +313,36 @@ func newTestDocumentMessage(fileName, mimeType string, fileSize int64, caption s
 			MimeType: mimeType,
 			FileSize: fileSize,
 		},
+	}
+}
+
+func TestIsPDFDocument(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mimeType string
+		fileName string
+		expected bool
+	}{
+		{name: "pdf mime type", mimeType: "application/pdf", fileName: "report.pdf", expected: true},
+		{name: "empty mime with pdf extension", mimeType: "", fileName: "report.pdf", expected: true},
+		{name: "octet-stream with pdf extension", mimeType: "application/octet-stream", fileName: "report.pdf", expected: true},
+		{name: "uppercase pdf extension", mimeType: "", fileName: "REPORT.PDF", expected: true},
+		{name: "empty mime with pdf extension uppercase", mimeType: "", fileName: "report.PDF", expected: true},
+		{name: "octet-stream with non-pdf extension", mimeType: "application/octet-stream", fileName: "report.docx", expected: false},
+		{name: "empty mime with non-pdf extension", mimeType: "", fileName: "report.txt", expected: false},
+		{name: "word mime type", mimeType: "application/msword", fileName: "report.doc", expected: false},
+		{name: "word mime type with pdf extension", mimeType: "application/msword", fileName: "report.pdf", expected: false},
+		{name: "image mime type", mimeType: "image/jpeg", fileName: "photo.jpg", expected: false},
+		{name: "pdf extension but not a pdf name", mimeType: "", fileName: "report.pdf.bak", expected: false},
+		{name: "no mime no extension", mimeType: "", fileName: "report", expected: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := isPDFDocument(tc.mimeType, tc.fileName); got != tc.expected {
+				t.Errorf("isPDFDocument(%q, %q) = %v, expected %v", tc.mimeType, tc.fileName, got, tc.expected)
+			}
+		})
 	}
 }
 
@@ -420,6 +508,109 @@ func TestHandleDocumentMessage_UnsupportedMimeType(t *testing.T) {
 			assertTempDirEmpty(t, tempdir)
 		})
 	}
+}
+
+// TestHandleDocumentMessage_EmptyMimeType verifies that a document with an empty
+// MIME type but a PDF file name is accepted and validated by content.
+func TestHandleDocumentMessage_EmptyMimeType(t *testing.T) {
+	t.Parallel()
+
+	pdf := []byte(testPDF)
+	tg := newTelegramMock(t)
+	tg.fileBody = pdf
+	kk := newKarakeepMock(t)
+
+	kb, tempdir := newTestKarakeepBot(t, tg, kk, 100)
+	msg := newTestDocumentMessage("report.pdf", "", int64(len(pdf)), "")
+
+	bookmark, err := kb.handleDocumentMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if _, ok := bookmark.(*AssetBookmark); !ok {
+		t.Fatalf("expected *AssetBookmark, got %T", bookmark)
+	}
+	if kk.uploadCalls() != 1 {
+		t.Errorf("expected 1 upload, got %d", kk.uploadCalls())
+	}
+
+	assertTempDirEmpty(t, tempdir)
+}
+
+// TestHandleDocumentMessage_OctetStreamMimeType verifies that a document with a
+// generic application/octet-stream MIME type but a PDF file name is accepted
+// and validated by content.
+func TestHandleDocumentMessage_OctetStreamMimeType(t *testing.T) {
+	t.Parallel()
+
+	pdf := []byte(testPDF)
+	tg := newTelegramMock(t)
+	tg.fileBody = pdf
+	kk := newKarakeepMock(t)
+
+	kb, tempdir := newTestKarakeepBot(t, tg, kk, 100)
+	msg := newTestDocumentMessage("report.pdf", "application/octet-stream", int64(len(pdf)), "")
+
+	bookmark, err := kb.handleDocumentMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if _, ok := bookmark.(*AssetBookmark); !ok {
+		t.Fatalf("expected *AssetBookmark, got %T", bookmark)
+	}
+	if kk.uploadCalls() != 1 {
+		t.Errorf("expected 1 upload, got %d", kk.uploadCalls())
+	}
+
+	assertTempDirEmpty(t, tempdir)
+}
+
+// TestHandleDocumentMessage_PDFExtensionButNotPDF verifies that a file with a
+// PDF extension but non-PDF content is rejected by the content validator.
+func TestHandleDocumentMessage_PDFExtensionButNotPDF(t *testing.T) {
+	t.Parallel()
+
+	plainText := []byte("this is not a pdf, just plain text content\n")
+	tg := newTelegramMock(t)
+	tg.fileBody = plainText
+	kk := newKarakeepMock(t)
+
+	kb, tempdir := newTestKarakeepBot(t, tg, kk, 100)
+	msg := newTestDocumentMessage("report.pdf", "application/octet-stream", int64(len(plainText)), "")
+
+	_, err := kb.handleDocumentMessage(context.Background(), msg)
+	if err == nil || !errors.Is(err, fileprocessor.ErrValidationFailed) {
+		t.Fatalf("expected ErrValidationFailed, got: %v", err)
+	}
+	if kk.uploadCalls() != 0 {
+		t.Errorf("expected no uploads, got %d", kk.uploadCalls())
+	}
+
+	assertTempDirEmpty(t, tempdir)
+}
+
+// TestHandleDocumentMessage_ExtensionOnlyIsNotEnough verifies that a file with
+// a PDF extension but a non-PDF MIME type and non-PDF content is rejected.
+func TestHandleDocumentMessage_ExtensionOnlyIsNotEnough(t *testing.T) {
+	t.Parallel()
+
+	plainText := []byte("this is not a pdf, just plain text content\n")
+	tg := newTelegramMock(t)
+	tg.fileBody = plainText
+	kk := newKarakeepMock(t)
+
+	kb, tempdir := newTestKarakeepBot(t, tg, kk, 100)
+	msg := newTestDocumentMessage("report.pdf", "", int64(len(plainText)), "")
+
+	_, err := kb.handleDocumentMessage(context.Background(), msg)
+	if err == nil || !errors.Is(err, fileprocessor.ErrValidationFailed) {
+		t.Fatalf("expected ErrValidationFailed, got: %v", err)
+	}
+	if kk.uploadCalls() != 0 {
+		t.Errorf("expected no uploads, got %d", kk.uploadCalls())
+	}
+
+	assertTempDirEmpty(t, tempdir)
 }
 
 func TestHandleDocumentMessage_DeclaredSizeExceedsLimit(t *testing.T) {
@@ -648,5 +839,123 @@ func TestHandleDocumentMessage_FallbackFileName(t *testing.T) {
 
 			assertTempDirEmpty(t, tempdir)
 		})
+	}
+}
+
+// TestHandleDocumentMessage_CaptionHashtags verifies that a document message
+// with hashtags in the caption is processed and the hashtags are preserved in
+// the bookmark note.
+func TestHandleDocumentMessage_CaptionHashtags(t *testing.T) {
+	t.Parallel()
+
+	pdf := []byte(testPDF)
+	tg := newTelegramMock(t)
+	tg.fileBody = pdf
+	kk := newKarakeepMock(t)
+
+	kb, tempdir := newTestKarakeepBot(t, tg, kk, 100)
+	msg := newTestDocumentMessage("report.pdf", "application/pdf", int64(len(pdf)), "check this out #golang #pdf")
+
+	bookmark, err := kb.handleDocumentMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+
+	ab, ok := bookmark.(*AssetBookmark)
+	if !ok {
+		t.Fatalf("expected *AssetBookmark, got %T", bookmark)
+	}
+	if ab.AssetType != PDFAssetType {
+		t.Errorf("expected asset type %s, got %s", PDFAssetType, ab.AssetType)
+	}
+	// The note should contain the caption with hashtags.
+	if !strings.Contains(ab.Note, "#golang") || !strings.Contains(ab.Note, "#pdf") {
+		t.Errorf("expected note to contain hashtags, got %q", ab.Note)
+	}
+
+	assertTempDirEmpty(t, tempdir)
+}
+
+// TestHandlePhotoMessage_SizeExceeded is a regression test: a photo whose
+// downloaded size exceeds the limit must produce ErrMaxsizeExceeded (not
+// ErrValidationFailed) and must not upload anything.
+func TestHandlePhotoMessage_SizeExceeded(t *testing.T) {
+	t.Parallel()
+
+	// A valid PNG that is larger than the 100-byte limit.
+	png := make([]byte, 101)
+	png[0] = 0x89
+	png[1] = 0x50
+	png[2] = 0x4e
+	png[3] = 0x47
+	tg := newTelegramMock(t)
+	tg.fileBody = png
+	kk := newKarakeepMock(t)
+
+	kb, tempdir := newTestKarakeepBot(t, tg, kk, 100)
+	msg := TelegramMessage{
+		ID:   42,
+		Chat: models.Chat{ID: 1, Type: models.ChatTypePrivate},
+		From: &models.User{ID: 7, Username: "tester"},
+		Photo: []models.PhotoSize{{
+			FileID:   "photo-file-id",
+			FileSize: 101,
+		}},
+	}
+
+	_, err := kb.handlePhotoMessage(context.Background(), msg)
+	if err == nil || !errors.Is(err, fileprocessor.ErrMaxsizeExceeded) {
+		t.Fatalf("expected ErrMaxsizeExceeded, got: %v", err)
+	}
+	if kk.uploadCalls() != 0 {
+		t.Errorf("expected no uploads, got %d", kk.uploadCalls())
+	}
+
+	assertTempDirEmpty(t, tempdir)
+}
+
+// TestSendDocumentWithCaption verifies that SendDocumentWithCaption sends the
+// document to the correct chat and thread with the given caption.
+func TestSendDocumentWithCaption(t *testing.T) {
+	t.Parallel()
+
+	tg := newTelegramMock(t)
+	kk := newKarakeepMock(t)
+
+	kb, _ := newTestKarakeepBot(t, tg, kk, 100)
+
+	msg := TelegramMessage{
+		ID:              42,
+		Chat:            models.Chat{ID: 12345, Type: models.ChatTypePrivate},
+		MessageThreadID: 678,
+		From:            &models.User{ID: 7, Username: "tester"},
+		Caption:         "my caption",
+		Document: &models.Document{
+			FileID:   "doc-file-id",
+			FileName: "report.pdf",
+			MimeType: "application/pdf",
+			FileSize: 100,
+		},
+	}
+
+	if err := kb.telegram.SendDocumentWithCaption(context.Background(), &msg, msg.Document.FileID, "my caption\n\n#golang #pdf"); err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+
+	sent := tg.document()
+	if sent == nil {
+		t.Fatal("expected a sendDocument call, got none")
+	}
+	if sent.chatID != 12345 {
+		t.Errorf("expected chat ID 12345, got %d", sent.chatID)
+	}
+	if sent.messageThreadID != 678 {
+		t.Errorf("expected message thread ID 678, got %d", sent.messageThreadID)
+	}
+	if sent.caption != "my caption\n\n#golang #pdf" {
+		t.Errorf("unexpected caption: %q", sent.caption)
+	}
+	if sent.document != "doc-file-id" {
+		t.Errorf("expected document ID doc-file-id, got %s", sent.document)
 	}
 }

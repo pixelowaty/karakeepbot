@@ -11,8 +11,9 @@ import (
 // pdfSignature is the magic header that every valid PDF file starts with.
 var pdfSignature = []byte("%PDF-")
 
-// PDFValidator checks if a file is a valid PDF document by verifying the PDF
-// signature in the file content, and returns its MIME type.
+// PDFValidator checks whether the file content starts with the PDF signature
+// ("%PDF-") and returns its MIME type. It only verifies the signature, not the
+// full structural validity of the PDF document.
 func PDFValidator(file *os.File) (string, error) {
 	// Ensure we read the file from the beginning.
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
