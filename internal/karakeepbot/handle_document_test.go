@@ -205,6 +205,10 @@ func (m *telegramMock) handle(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":42}}`))
 			return
 
+		case "deleteMessage":
+			_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+			return
+
 		default:
 			_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
 		}
@@ -409,6 +413,8 @@ func TestIsPDFDocument(t *testing.T) {
 		expected bool
 	}{
 		{name: "pdf mime type", mimeType: "application/pdf", fileName: "report.pdf", expected: true},
+		{name: "uppercase pdf mime type", mimeType: "Application/PDF", fileName: "report.pdf", expected: true},
+		{name: "pdf mime type with charset parameter", mimeType: "application/pdf; charset=binary", fileName: "report.pdf", expected: true},
 		{name: "empty mime with pdf extension", mimeType: "", fileName: "report.pdf", expected: true},
 		{name: "octet-stream with pdf extension", mimeType: "application/octet-stream", fileName: "report.pdf", expected: true},
 		{name: "uppercase pdf extension", mimeType: "", fileName: "REPORT.PDF", expected: true},

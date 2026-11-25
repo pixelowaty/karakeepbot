@@ -72,7 +72,7 @@ maxsize = 10485760
 
 # Allowed MIME types for file download/uploads. If the list is empty, no
 # validation will be performed on the file type.
-mimetypes = ["image/jpeg", "image/png", "image/webp"]
+mimetypes = ["image/jpeg", "image/png", "image/webp", "application/pdf"]
 
 # Maximum time to wait for file download in seconds (default: 30)
 timeout = 30

@@ -3,10 +3,13 @@ package karakeepbot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,33 +18,32 @@ import (
 	"github.com/go-telegram/bot/models"
 
 	"github.com/Madh93/karakeepbot/internal/config"
+	"github.com/Madh93/karakeepbot/internal/fileprocessor"
+	"github.com/Madh93/karakeepbot/internal/filevalidator"
 	"github.com/Madh93/karakeepbot/internal/logging"
 )
 
-// tagServer is a minimal fake Karakeep API server that handles GET and PATCH
-// /api/v1/bookmarks/:id for testing the tag completion wait and title update
-// logic.
+// tagServer is a fake Karakeep API server for testing tag polling and full
+// handler flows (assets, bookmarks, tags).
 type tagServer struct {
 	server *httptest.Server
 	client *karakeep.ClientWithResponses
 
-	mu          sync.Mutex
-	bookmarks   map[string]*karakeep.Bookmark
-	tagsReadyAt time.Time
-
-	// patchCalls records the PATCH request bodies received, keyed by bookmark
-	// ID, for asserting that summary is preserved alongside title.
-	patchCalls map[string]map[string]json.RawMessage
+	mu         sync.Mutex
+	bookmarks  map[string]*karakeep.Bookmark
+	getCalls   int
+	getErrors  int
+	nextBoomID int
 }
 
 func newTagServer(t *testing.T) *tagServer {
 	t.Helper()
 
 	s := &tagServer{
-		bookmarks:  make(map[string]*karakeep.Bookmark),
-		patchCalls: make(map[string]map[string]json.RawMessage),
+		bookmarks: make(map[string]*karakeep.Bookmark),
 	}
 	s.server = httptest.NewServer(http.HandlerFunc(s.handle))
+	t.Cleanup(s.server.Close)
 
 	client, err := karakeep.NewClientWithResponses(s.server.URL + "/api/v1")
 	if err != nil {
@@ -53,50 +55,84 @@ func newTagServer(t *testing.T) *tagServer {
 }
 
 func (s *tagServer) handle(w http.ResponseWriter, r *http.Request) {
-	// Expected path: /api/v1/bookmarks/{id}
-	// The Karakeep client prepends "." to the operation path to make it relative,
-	// preserving the /api/v1 prefix from the client's base URL.
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/assets" {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "missing file part: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		body, readErr := io.ReadAll(file)
+		_ = file.Close()
+		if readErr != nil {
+			http.Error(w, readErr.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"assetId":"asset-123","fileName":%q,"contentType":%q,"size":%d}`, header.Filename, header.Header.Get("Content-Type"), len(body))
+		return
+	}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/api/v1/bookmarks" {
+		s.mu.Lock()
+		s.nextBoomID++
+		id := fmt.Sprintf("bm-created-%d", s.nextBoomID)
+		bm := &karakeep.Bookmark{
+			Id:            id,
+			TaggingStatus: ptrStatus("pending"),
+		}
+		s.bookmarks[id] = bm
+		s.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(bm)
+		return
+	}
+
 	const prefix = "/api/v1/bookmarks/"
 	if !strings.HasPrefix(r.URL.Path, prefix) {
 		http.NotFound(w, r)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, prefix)
-	if id == "" {
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	if rest == "" {
 		http.NotFound(w, r)
 		return
 	}
 
-	if r.Method == http.MethodPatch {
-		var body map[string]json.RawMessage
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"invalid json"}`))
+	// POST /api/v1/bookmarks/{id}/tags
+	if r.Method == http.MethodPost && strings.HasSuffix(rest, "/tags") {
+		id := strings.TrimSuffix(rest, "/tags")
+		var payload struct {
+			Tags []struct {
+				TagName string `json:"tagName"`
+			} `json:"tags"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		s.mu.Lock()
-		s.patchCalls[id] = body
-		// Apply the title/summary patch to the stored bookmark.
 		if bm, exists := s.bookmarks[id]; exists {
-			if raw, ok := body["title"]; ok && string(raw) != "null" {
-				var title string
-				_ = json.Unmarshal(raw, &title)
-				bm.Title = &title
-			}
-			if raw, ok := body["summary"]; ok {
-				if string(raw) == "null" {
-					bm.Summary = nil
-				} else {
-					var summary string
-					_ = json.Unmarshal(raw, &summary)
-					bm.Summary = &summary
-				}
+			for _, t := range payload.Tags {
+				bm.Tags = append(bm.Tags, struct {
+					AttachedBy karakeep.BookmarkTagsAttachedBy `json:"attachedBy"`
+					Id         string                          `json:"id"`
+					Name       string                          `json:"name"`
+				}{
+					AttachedBy: karakeep.Human,
+					Name:       t.TagName,
+				})
 			}
 		}
 		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"attached":[]}`))
 		return
 	}
 
@@ -105,59 +141,36 @@ func (s *tagServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	id := rest
 	s.mu.Lock()
+	s.getCalls++
+	if s.getErrors > 0 {
+		s.getErrors--
+		s.mu.Unlock()
+		http.Error(w, "temporary error", http.StatusInternalServerError)
+		return
+	}
 	bm, exists := s.bookmarks[id]
-	fail := !exists
+	var snapshot *karakeep.Bookmark
+	if exists {
+		cp := *bm
+		cp.Tags = append([]struct {
+			AttachedBy karakeep.BookmarkTagsAttachedBy `json:"attachedBy"`
+			Id         string                          `json:"id"`
+			Name       string                          `json:"name"`
+		}(nil), bm.Tags...)
+		snapshot = &cp
+	}
 	s.mu.Unlock()
 
-	if fail {
+	if snapshot == nil {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":"not found"}`))
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(bm)
-}
-
-// setBookmarkFull sets a bookmark with full control over title, summary,
-// summarization status, and tags.
-func (s *tagServer) setBookmarkFull(id, status, summarizationStatus string, summary *string, title *string, tags []karakeep.BookmarkTagsAttachedBy) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	b := &karakeep.Bookmark{
-		Id:                  id,
-		TaggingStatus:       ptrStatus(status),
-		SummarizationStatus: ptrSummarizationStatus(summarizationStatus),
-		Summary:             summary,
-		Title:               title,
-	}
-	for _, name := range tags {
-		b.Tags = append(b.Tags, struct {
-			AttachedBy karakeep.BookmarkTagsAttachedBy `json:"attachedBy"`
-			Id         string                          `json:"id"`
-			Name       string                          `json:"name"`
-		}{
-			AttachedBy: karakeep.BookmarkTagsAttachedBy(name),
-			Name:       string(name),
-		})
-	}
-	s.bookmarks[id] = b
-}
-
-// patchCall returns the raw JSON body of the last PATCH for the given ID.
-func (s *tagServer) patchCall(id string) (map[string]json.RawMessage, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.patchCalls[id]
-	return c, ok
-}
-
-// ptrSummarizationStatus returns a pointer to a BookmarkSummarizationStatus.
-func ptrSummarizationStatus(s string) *karakeep.BookmarkSummarizationStatus {
-	status := karakeep.BookmarkSummarizationStatus(s)
-	return &status
+	_ = json.NewEncoder(w).Encode(snapshot)
 }
 
 // setBookmark sets the bookmark state for the given ID.
@@ -176,7 +189,7 @@ func (s *tagServer) setBookmark(id string, status string, tags []karakeep.Bookma
 				Id         string                          `json:"id"`
 				Name       string                          `json:"name"`
 			}{
-				AttachedBy: karakeep.BookmarkTagsAttachedBy(name),
+				AttachedBy: name,
 				Name:       string(name),
 			})
 		}
@@ -184,9 +197,39 @@ func (s *tagServer) setBookmark(id string, status string, tags []karakeep.Bookma
 	s.bookmarks[id] = b
 }
 
-// ptrString returns a pointer to a string.
-func ptrString(s string) *string {
-	return &s
+// appendAITags updates an existing bookmark to success and appends AI tags
+// while preserving existing tags (e.g., #telegram).
+func (s *tagServer) appendAITags(id string, aiTags ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bm, exists := s.bookmarks[id]
+	if !exists {
+		return
+	}
+	bm.TaggingStatus = ptrStatus("success")
+	for _, name := range aiTags {
+		bm.Tags = append(bm.Tags, struct {
+			AttachedBy karakeep.BookmarkTagsAttachedBy `json:"attachedBy"`
+			Id         string                          `json:"id"`
+			Name       string                          `json:"name"`
+		}{
+			AttachedBy: karakeep.Ai,
+			Name:       name,
+		})
+	}
+}
+
+func (s *tagServer) setTransientGetErrors(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getErrors = n
+}
+
+func (s *tagServer) totalGetCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
 }
 
 // ptrStatus returns a pointer to a BookmarkTaggingStatus.
@@ -205,10 +248,60 @@ func waitForBookmark(t *testing.T, kk *tagServer) *KarakeepBot {
 	}
 
 	return &KarakeepBot{
-		karakeep:     &Karakeep{ClientWithResponses: kk.client},
-		telegram:     &Telegram{Bot: botAPI},
-		logger:       logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"}),
-		waitInterval: 1, // faster for tests
+		karakeep:       &Karakeep{ClientWithResponses: kk.client},
+		telegram:       &Telegram{Bot: botAPI},
+		logger:         logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"}),
+		waitInterval:   0,
+		bgPollInterval: 20 * time.Millisecond,
+		bgPollTimeout:  2 * time.Second,
+	}
+}
+
+func TestKarakeepBookmark_AttrsNilTaggingStatus(t *testing.T) {
+	t.Parallel()
+
+	bm := KarakeepBookmark{Id: "bm-nil"}
+	attrs := bm.Attrs()
+	found := false
+	for i := 0; i+1 < len(attrs); i += 2 {
+		if attrs[i] == "tagging_status" && attrs[i+1] == "<nil>" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected tagging_status=<nil> in attrs, got %v", attrs)
+	}
+}
+
+func TestNewTelegramHTTPClient(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	logger := logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"})
+
+	// When ProxyEnabled is false, Transport must be untyped nil (no panic).
+	client := newTelegramHTTPClient(logger, &config.TelegramConfig{ProxyEnabled: false})
+	if client.Transport != nil {
+		t.Fatalf("expected nil Transport when proxy is disabled, got %T", client.Transport)
+	}
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("unexpected error using non-proxy HTTP client: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// When ProxyEnabled is true, Transport must configure the proxy.
+	proxyClient := newTelegramHTTPClient(logger, &config.TelegramConfig{
+		ProxyEnabled: true,
+		ProxyURL:     "http://127.0.0.1:8080",
+	})
+	tr, ok := proxyClient.Transport.(*http.Transport)
+	if !ok || tr == nil || tr.Proxy == nil {
+		t.Fatalf("expected configured *http.Transport with Proxy when ProxyEnabled=true, got %#v", proxyClient.Transport)
 	}
 }
 
@@ -223,14 +316,6 @@ func TestWaitForTagCompletion_ImmediateSuccess(t *testing.T) {
 	bookmark := &KarakeepBookmark{
 		Id:            "bm-1",
 		TaggingStatus: ptrStatus("success"),
-		Tags: []struct {
-			AttachedBy karakeep.BookmarkTagsAttachedBy `json:"attachedBy"`
-			Id         string                          `json:"id"`
-			Name       string                          `json:"name"`
-		}{{
-			AttachedBy: "ai",
-			Name:       "golang",
-		}},
 	}
 
 	result, err := kb.waitForTagCompletion(context.Background(), bookmark)
@@ -250,21 +335,19 @@ func TestWaitForTagCompletion_DelayedSuccess(t *testing.T) {
 
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
+	kb.waitInterval = 1
 
-	// Start with pending
 	server.setBookmark("bm-2", "pending", nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Start polling in the background while another goroutine makes tags ready
 	type resultPair struct {
 		result *TagCompletionResult
 		err    error
 	}
 
-	done := make(chan resultPair)
-
+	done := make(chan resultPair, 1)
 	go func() {
 		result, err := kb.waitForTagCompletion(ctx, &KarakeepBookmark{
 			Id:            "bm-2",
@@ -273,8 +356,7 @@ func TestWaitForTagCompletion_DelayedSuccess(t *testing.T) {
 		done <- resultPair{result, err}
 	}()
 
-	// After 2 seconds, make tags ready
-	time.Sleep(2 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	server.setBookmark("bm-2", "success", []karakeep.BookmarkTagsAttachedBy{"ai", "karakeep"})
 
 	pair := <-done
@@ -295,7 +377,6 @@ func TestWaitForTagCompletion_Timeout(t *testing.T) {
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
 
-	// Always pending
 	server.setBookmark("bm-3", "pending", nil)
 
 	result, err := kb.waitForTagCompletion(context.Background(), &KarakeepBookmark{
@@ -330,6 +411,30 @@ func TestWaitForTagCompletion_Failure(t *testing.T) {
 	}
 }
 
+func TestWaitForTagCompletion_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	server := newTagServer(t)
+	kb := waitForBookmark(t, server)
+	kb.waitInterval = 10
+
+	server.setBookmark("bm-ctx", "pending", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := kb.waitForTagCompletion(ctx, &KarakeepBookmark{
+		Id:            "bm-ctx",
+		TaggingStatus: ptrStatus("pending"),
+	})
+	if err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+}
+
 func TestContinueWaitForTags_DelayedTags(t *testing.T) {
 	t.Parallel()
 
@@ -338,68 +443,119 @@ func TestContinueWaitForTags_DelayedTags(t *testing.T) {
 
 	server.setBookmark("bm-5", "pending", nil)
 
-	var onUpdateCalled bool
-	var onUpdateTags int
+	var onUpdateCalled atomic.Bool
+	var onUpdateTags atomic.Int32
 
-	done := make(chan struct{})
-	go func() {
-		kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
-			Id:            "bm-5",
-			TaggingStatus: ptrStatus("pending"),
-		}, func(updated *KarakeepBookmark) {
-			onUpdateCalled = true
-			onUpdateTags = len(updated.Tags)
-			close(done)
-		})
-	}()
+	done := kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
+		Id:            "bm-5",
+		TaggingStatus: ptrStatus("pending"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+		onUpdateTags.Store(int32(len(updated.Tags)))
+	})
 
-	// After 3 seconds, make tags ready (giving the 15s initial delay + some buffer)
-	time.Sleep(3 * time.Second)
+	time.Sleep(50 * time.Millisecond)
 	server.setBookmark("bm-5", "success", []karakeep.BookmarkTagsAttachedBy{"ai", "karakeep"})
 
-	// Wait for the callback with a generous timeout
 	select {
 	case <-done:
-		if !onUpdateCalled {
-			t.Error("expected onUpdate callback to be called")
-		}
-		if onUpdateTags == 0 {
-			t.Error("expected onUpdateTags > 0")
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for tags to be discovered")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ContinueWaitForTags to finish")
+	}
+
+	if !onUpdateCalled.Load() {
+		t.Error("expected onUpdate callback to be called")
+	}
+	if onUpdateTags.Load() == 0 {
+		t.Error("expected onUpdateTags > 0")
 	}
 }
 
-func TestContinueWaitForTags_NoTagsFound(t *testing.T) {
+func TestContinueWaitForTags_SuccessWithZeroTagsStopsImmediately(t *testing.T) {
+	t.Parallel()
+
+	server := newTagServer(t)
+	kb := waitForBookmark(t, server)
+	kb.bgPollTimeout = 5 * time.Second
+
+	server.setBookmark("bm-empty", "success", nil)
+
+	var onUpdateCalled atomic.Bool
+	done := kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
+		Id:            "bm-empty",
+		TaggingStatus: ptrStatus("pending"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+	})
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected ContinueWaitForTags to exit promptly when tagging succeeds with 0 tags")
+	}
+
+	if onUpdateCalled.Load() {
+		t.Error("expected onUpdate NOT to be called when 0 tags were generated")
+	}
+	if calls := server.totalGetCalls(); calls != 1 {
+		t.Errorf("expected exactly 1 poll call, got %d", calls)
+	}
+}
+
+func TestContinueWaitForTags_TransientErrorRetries(t *testing.T) {
 	t.Parallel()
 
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
 
-	server.setBookmark("bm-6", "pending", nil)
+	server.setBookmark("bm-retry", "success", []karakeep.BookmarkTagsAttachedBy{"ai"})
+	server.setTransientGetErrors(2)
 
-	var onUpdateCalled bool
-	done := make(chan struct{})
-	go func() {
-		kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
-			Id:            "bm-6",
-			TaggingStatus: ptrStatus("pending"),
-		}, func(updated *KarakeepBookmark) {
-			onUpdateCalled = true
-			close(done)
-		})
-	}()
+	var onUpdateCalled atomic.Bool
+	done := kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
+		Id:            "bm-retry",
+		TaggingStatus: ptrStatus("pending"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+	})
 
-	// Wait for the full 5-minute timeout but only wait a reasonable time for the test
 	select {
 	case <-done:
-		if onUpdateCalled {
-			t.Error("expected onUpdate callback NOT to be called for tags that never appear")
-		}
-	case <-time.After(45 * time.Second):
-		// Expected: the callback is not called within 45s because tags are still pending
-		// (the full 5-minute timeout has not yet elapsed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ContinueWaitForTags after transient errors")
+	}
+
+	if !onUpdateCalled.Load() {
+		t.Error("expected onUpdate to be called after transient errors recovered")
+	}
+}
+
+func TestContinueWaitForTags_NoTagsFoundTimeout(t *testing.T) {
+	t.Parallel()
+
+	server := newTagServer(t)
+	kb := waitForBookmark(t, server)
+	kb.bgPollInterval = 15 * time.Millisecond
+	kb.bgPollTimeout = 80 * time.Millisecond
+
+	server.setBookmark("bm-6", "pending", nil)
+
+	var onUpdateCalled atomic.Bool
+	done := kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
+		Id:            "bm-6",
+		TaggingStatus: ptrStatus("pending"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+	})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for bgPollTimeout")
+	}
+
+	if onUpdateCalled.Load() {
+		t.Error("expected onUpdate NOT to be called when tags stay pending until timeout")
 	}
 }
 
@@ -409,28 +565,24 @@ func TestContinueWaitForTags_AlreadyComplete(t *testing.T) {
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
 
-	// Tags are already ready
 	server.setBookmark("bm-7", "success", []karakeep.BookmarkTagsAttachedBy{"ai"})
 
-	var onUpdateCalled bool
-	done := make(chan struct{})
-	go func() {
-		kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
-			Id:            "bm-7",
-			TaggingStatus: ptrStatus("success"),
-		}, func(updated *KarakeepBookmark) {
-			onUpdateCalled = true
-			close(done)
-		})
-	}()
+	var onUpdateCalled atomic.Bool
+	done := kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
+		Id:            "bm-7",
+		TaggingStatus: ptrStatus("success"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+	})
 
 	select {
 	case <-done:
-		if !onUpdateCalled {
-			t.Error("expected onUpdate callback to be called when tags are already ready")
-		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for already-ready tags callback")
+	}
+
+	if !onUpdateCalled.Load() {
+		t.Error("expected onUpdate callback to be called when tags are already ready")
 	}
 }
 
@@ -440,35 +592,24 @@ func TestContinueWaitForTags_TaggingFailure(t *testing.T) {
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
 
-	// Set bookmark to failure immediately
 	server.setBookmark("bm-8", "failure", nil)
 
-	var onUpdateCalled bool
-	done := make(chan struct{})
+	var onUpdateCalled atomic.Bool
+	done := kb.ContinueWaitForTags(context.Background(), &KarakeepBookmark{
+		Id:            "bm-8",
+		TaggingStatus: ptrStatus("failure"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+	})
 
-	// Run ContinueWaitForTags in a goroutine with a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-
-	go func() {
-		kb.ContinueWaitForTags(ctx, &KarakeepBookmark{
-			Id:            "bm-8",
-			TaggingStatus: ptrStatus("failure"),
-		}, func(updated *KarakeepBookmark) {
-			onUpdateCalled = true
-		})
-		close(done)
-	}()
-
-	// Wait for the goroutine to finish (it should exit after detecting failure)
 	select {
 	case <-done:
-		// The callback should NOT be called for failed tagging
-		if onUpdateCalled {
-			t.Error("expected onUpdate callback NOT to be called for failed tagging")
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for ContinueWaitForTags to exit")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ContinueWaitForTags to exit on failure")
+	}
+
+	if onUpdateCalled.Load() {
+		t.Error("expected onUpdate callback NOT to be called for failed tagging")
 	}
 }
 
@@ -478,7 +619,6 @@ func TestTagCompletionResult_HashtagsOnSuccess(t *testing.T) {
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
 
-	// Bookmark with AI-generated tags
 	server.setBookmark("bm-9", "success", []karakeep.BookmarkTagsAttachedBy{"golang", "pdf"})
 
 	result, err := kb.waitForTagCompletion(context.Background(), &KarakeepBookmark{
@@ -501,9 +641,6 @@ func TestTagCompletionResult_HashtagsOnTimeout(t *testing.T) {
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
 
-	// Bookmark that stays pending - will timeout
-	// The server doesn't add tags for pending status, so the returned bookmark
-	// will have no tags
 	server.setBookmark("bm-10", "pending", nil)
 
 	result, err := kb.waitForTagCompletion(context.Background(), &KarakeepBookmark{
@@ -514,16 +651,12 @@ func TestTagCompletionResult_HashtagsOnTimeout(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// When tagging is still pending and times out, the server's bookmark is returned
-	// (which has no tags in the pending state)
 	hashtags := result.Bookmark.Hashtags()
 	if hashtags != "" {
 		t.Errorf("expected empty hashtags for pending/timeout, got %q", hashtags)
 	}
 }
 
-// TestWaitForTagCompletion_NonExistentBookmark verifies that a 404 on the
-// first poll returns an error (not a panic or infinite loop).
 func TestWaitForTagCompletion_NonExistentBookmark(t *testing.T) {
 	t.Parallel()
 
@@ -539,129 +672,40 @@ func TestWaitForTagCompletion_NonExistentBookmark(t *testing.T) {
 	}
 }
 
-// TestContinueWaitForTags_ContextCancellation verifies that the background
-// goroutine exits cleanly when the context is cancelled.
 func TestContinueWaitForTags_ContextCancellation(t *testing.T) {
 	t.Parallel()
 
 	server := newTagServer(t)
 	kb := waitForBookmark(t, server)
+	kb.bgPollInterval = 1 * time.Second
+	kb.bgPollTimeout = 10 * time.Second
 
 	server.setBookmark("bm-cancel", "pending", nil)
 
-	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go func() {
-		kb.ContinueWaitForTags(ctx, &KarakeepBookmark{
-			Id:            "bm-cancel",
-			TaggingStatus: ptrStatus("pending"),
-		}, func(updated *KarakeepBookmark) {
-			// Should not be called
-			t.Error("callback should not be called after context cancellation")
-		})
-		close(done)
-	}()
+	var onUpdateCalled atomic.Bool
+	done := kb.ContinueWaitForTags(ctx, &KarakeepBookmark{
+		Id:            "bm-cancel",
+		TaggingStatus: ptrStatus("pending"),
+	}, func(updated *KarakeepBookmark) {
+		onUpdateCalled.Store(true)
+	})
 
-	// Cancel the parent context immediately
 	cancel()
 
-	// The goroutine should exit within a reasonable time
 	select {
 	case <-done:
-		// Expected: goroutine exited
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for goroutine to exit after context cancellation")
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for background goroutine to exit after context cancellation")
+	}
+
+	if onUpdateCalled.Load() {
+		t.Error("callback should not be called after context cancellation")
 	}
 }
 
-// TestContinueWaitForTags_WithEditMessageCaption verifies the full handler
-// flow: wait timeout -> background poll -> edit caption.
-func TestContinueWaitForTags_WithEditMessageCaption(t *testing.T) {
-	t.Parallel()
-
-	// Telegram mock for sendDocument and editMessageCaption
-	tg := newTelegramMock(t)
-
-	// Tag server for the continuation wait
-	tagSrv := newTagServer(t)
-
-	botAPI, err := tgbotapi.New(testToken, tgbotapi.WithServerURL(tg.server.URL), tgbotapi.WithSkipGetMe())
-	if err != nil {
-		t.Fatalf("failed to create telegram bot: %v", err)
-	}
-
-	kb := &KarakeepBot{
-		telegram:     &Telegram{Bot: botAPI},
-		karakeep:     &Karakeep{ClientWithResponses: tagSrv.client},
-		logger:       logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"}),
-		waitInterval: 1,
-	}
-
-	msg := TelegramMessage{
-		ID:      42,
-		Chat:    models.Chat{ID: 12345, Type: models.ChatTypePrivate},
-		From:    &models.User{ID: 7, Username: "tester"},
-		Caption: "test caption",
-		Document: &models.Document{
-			FileID: "doc-file-id",
-		},
-	}
-
-	// Simulate sending the Telegram document (first send with initial tags)
-	caption := msg.Caption + "\n\n#telegram"
-	msgID, err := kb.telegram.SendDocumentWithCaption(context.Background(), &msg, msg.Document.FileID, caption)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if msgID != 1 {
-		t.Errorf("expected message ID 1, got %d", msgID)
-	}
-
-	// Create a KarakeepBookmark with pending status
-	kbBookmark := &KarakeepBookmark{
-		Id:            "bm-edit-test",
-		TaggingStatus: ptrStatus("pending"),
-	}
-
-	// Set the bookmark to success immediately on the server.
-	// ContinueWaitForTags will detect this after its 15s initial delay.
-	tagSrv.setBookmark(kbBookmark.Id, "success", []karakeep.BookmarkTagsAttachedBy{"golang", "pdf"})
-
-	// Start the continuation wait with an EditMessageCaption callback
-	var editCalled bool
-	var editCaption string
-	kb.ContinueWaitForTags(context.Background(), kbBookmark, func(updated *KarakeepBookmark) {
-		editCaption = updated.Hashtags()
-		if err := kb.telegram.EditMessageCaption(context.Background(), msg.Chat.ID, msgID, editCaption); err != nil {
-			t.Errorf("EditMessageCaption failed: %v", err)
-		}
-		editCalled = true
-	})
-
-	// Wait for the edit to happen (poll happens after 15s initial delay)
-	select {
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for tag discovery and caption edit")
-	case <-time.After(20 * time.Second):
-		// Give it a moment for the poll + callback to complete
-	}
-
-	if !editCalled {
-		t.Error("expected EditMessageCaption callback to be called")
-	}
-
-	edits := tg.edits()
-	if len(edits) == 0 {
-		t.Error("expected at least one editMessageCaption call")
-	} else if edits[0].caption != "#golang #pdf" {
-		t.Errorf("expected caption '#golang #pdf', got %q", edits[0].caption)
-	}
-}
-
-// TestContinueWaitForTags_WithEditMessageText verifies the full handler flow
-// for a plain text/URL message: wait timeout -> background poll -> edit text.
-func TestContinueWaitForTags_WithEditMessageText(t *testing.T) {
+func TestHandler_TextBookmark_BackgroundTags_NoDoubleHashtags(t *testing.T) {
 	t.Parallel()
 
 	tg := newTelegramMock(t)
@@ -672,266 +716,133 @@ func TestContinueWaitForTags_WithEditMessageText(t *testing.T) {
 		t.Fatalf("failed to create telegram bot: %v", err)
 	}
 
-	kb := &KarakeepBot{
-		telegram:     &Telegram{Bot: botAPI},
-		karakeep:     &Karakeep{ClientWithResponses: tagSrv.client},
-		logger:       logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"}),
-		waitInterval: 1,
+	kb := KarakeepBot{
+		telegram:       &Telegram{Bot: botAPI},
+		karakeep:       &Karakeep{ClientWithResponses: tagSrv.client},
+		logger:         logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"}),
+		waitInterval:   0,
+		bgPollInterval: 20 * time.Millisecond,
+		bgPollTimeout:  2 * time.Second,
 	}
 
-	msg := TelegramMessage{
-		ID:   42,
-		Chat: models.Chat{ID: 12345, Type: models.ChatTypePrivate},
-		From: &models.User{ID: 7, Username: "tester"},
-		Text: "https://example.com",
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Simulate sending the text message (first send with initial tags).
-	initialText := msg.Text + "\n\n#telegram"
-	msgID, err := kb.telegram.SendNewMessage(context.Background(), &TelegramMessage{
-		ID:   msg.ID,
-		Chat: msg.Chat,
-		From: msg.From,
-		Text: initialText,
+	kb.handler(ctx, nil, &TelegramUpdate{
+		Message: &models.Message{
+			ID:   42,
+			Chat: models.Chat{ID: 12345, Type: models.ChatTypePrivate},
+			From: &models.User{ID: 7, Username: "tester"},
+			Text: "https://example.com",
+		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if msgID != 1 {
-		t.Errorf("expected message ID 1, got %d", msgID)
-	}
 
-	// Bookmark with pending status, no title, summarization success with a
-	// summary (so the title update path is exercised).
-	tagSrv.setBookmarkFull("bm-text-edit", "pending", "success", ptrString(""), nil, nil)
-
-	kbBookmark := &KarakeepBookmark{
-		Id:            "bm-text-edit",
-		TaggingStatus: ptrStatus("pending"),
+	replies := tg.replies()
+	if len(replies) != 1 || replies[0] != "https://example.com\n\n#telegram" {
+		t.Fatalf("expected initial message %q, got %v", "https://example.com\n\n#telegram", replies)
 	}
 
-	// Replicate the handler's callback: edit text + ensure title.
-	var editCalled bool
-	initialHashtags := "#telegram"
-	kb.ContinueWaitForTags(context.Background(), kbBookmark, func(updated *KarakeepBookmark) {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
+	// Simulate Karakeep finishing AI tagging in the background.
+	tagSrv.appendAITags("bm-created-1", "ai", "golang")
 
-		updatedHashtags := updated.Hashtags()
-		if updatedHashtags != "" && updatedHashtags != initialHashtags {
-			text := msg.Text + "\n\n" + updatedHashtags
-			if err := kb.telegram.EditMessageText(bgCtx, msg.Chat.ID, msgID, text); err != nil {
-				t.Errorf("EditMessageText failed: %v", err)
-			}
-			editCalled = true
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(tg.edits()) > 0 {
+			break
 		}
-		kb.ensureBookmarkTitle(bgCtx, updated)
-	})
-
-	// Set tags ready after the 15s initial delay so the poll discovers them.
-	time.Sleep(16 * time.Second)
-	tagSrv.setBookmarkFull("bm-text-edit", "success", "success", ptrString(""), nil, []karakeep.BookmarkTagsAttachedBy{"ai"})
-
-	// Wait for the edit to happen.
-	select {
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for tag discovery and text edit")
-	case <-time.After(20 * time.Second):
-	}
-
-	if !editCalled {
-		t.Error("expected EditMessageText callback to be called")
+		time.Sleep(15 * time.Millisecond)
 	}
 
 	edits := tg.edits()
-	foundText := false
-	for _, e := range edits {
-		if e.isText && e.text == "https://example.com\n\n#ai" {
-			foundText = true
-		}
+	if len(edits) != 1 {
+		t.Fatalf("expected 1 editMessageText call, got %d (%+v)", len(edits), edits)
 	}
-	if !foundText {
-		t.Errorf("expected an editMessageText call with the AI tags, got %v", edits)
+	if !edits[0].isText {
+		t.Errorf("expected editMessageText, got %+v", edits[0])
 	}
-}
-
-// TestUpdateBookmarkTitle_FromSummary verifies that UpdateBookmarkTitle sends a
-// minimal PATCH payload containing only the title, without serializing explicit
-// null values for other fields (which Karakeep's Zod validation rejects).
-func TestUpdateBookmarkTitle_FromSummary(t *testing.T) {
-	t.Parallel()
-
-	tagSrv := newTagServer(t)
-	kb := waitForBookmark(t, tagSrv)
-
-	// Bookmark with a summary and no title.
-	summary := "This is a great article about Go. It covers concurrency."
-	tagSrv.setBookmarkFull("bm-title-1", "success", "success", &summary, nil, nil)
-
-	bookmark := &KarakeepBookmark{
-		Id:            "bm-title-1",
-		TaggingStatus: ptrStatus("success"),
-		Summary:       &summary,
-	}
-
-	newTitle := bookmark.GenerateTitleFromAI(120)
-	if newTitle == "" {
-		t.Fatal("expected a non-empty title from summary")
-	}
-
-	if err := kb.karakeep.UpdateBookmarkTitle(context.Background(), bookmark, newTitle); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Verify the PATCH payload was recorded.
-	body, ok := tagSrv.patchCall("bm-title-1")
-	if !ok {
-		t.Fatal("expected a PATCH call to be recorded")
-	}
-
-	// The payload must contain a non-null title.
-	var title string
-	rawTitle, hasTitle := body["title"]
-	if !hasTitle || string(rawTitle) == "null" {
-		t.Error("expected a non-null title in PATCH payload")
-	} else {
-		_ = json.Unmarshal(rawTitle, &title)
-		if title != newTitle {
-			t.Errorf("expected title %q, got %q", newTitle, title)
-		}
-	}
-
-	// The payload must NOT send explicit null values for other fields.
-	for _, field := range []string{"createdAt", "summary", "text", "assetContent", "author"} {
-		if raw, present := body[field]; present && string(raw) == "null" {
-			t.Errorf("PATCH payload must not send %q: null, got %s", field, string(raw))
-		}
+	wantText := "https://example.com\n\n#telegram #ai #golang"
+	if edits[0].text != wantText {
+		t.Errorf("expected edited text %q (without duplicate #telegram), got %q", wantText, edits[0].text)
 	}
 }
 
-// TestUpdateBookmarkTitle_FallbackToAItags verifies that when the summary is
-// empty, GenerateTitleFromAI falls back to AI-attached tags.
-func TestUpdateBookmarkTitle_FallbackToAItags(t *testing.T) {
+func TestHandler_PDFDocument_BackgroundTags_EmptyCaption(t *testing.T) {
 	t.Parallel()
 
+	tg := newTelegramMock(t)
+	tg.fileBody = []byte(testPDF)
 	tagSrv := newTagServer(t)
-	kb := waitForBookmark(t, tagSrv)
 
-	// Bookmark with empty summary but AI tags.
-	tagSrv.setBookmarkFull("bm-title-2", "success", "success", ptrString(""), nil, []karakeep.BookmarkTagsAttachedBy{"ai"})
+	botAPI, err := tgbotapi.New(testToken, tgbotapi.WithServerURL(tg.server.URL), tgbotapi.WithSkipGetMe())
+	if err != nil {
+		t.Fatalf("failed to create telegram bot: %v", err)
+	}
 
-	bookmark := &KarakeepBookmark{
-		Id:            "bm-title-2",
-		TaggingStatus: ptrStatus("success"),
-		Summary:       ptrString(""),
-		Tags: []struct {
-			AttachedBy karakeep.BookmarkTagsAttachedBy `json:"attachedBy"`
-			Id         string                          `json:"id"`
-			Name       string                          `json:"name"`
-		}{
-			{AttachedBy: karakeep.Ai, Name: "golang"},
-			{AttachedBy: karakeep.Ai, Name: "pdf"},
-			{AttachedBy: karakeep.Human, Name: "manual"},
+	tempdir := t.TempDir()
+	fp, err := fileprocessor.New(&config.FileProcessorConfig{
+		Tempdir: tempdir,
+		Maxsize: 1024,
+		Timeout: 5,
+	}, false, "")
+	if err != nil {
+		t.Fatalf("failed to create file processor: %v", err)
+	}
+
+	kb := KarakeepBot{
+		telegram:       &Telegram{Bot: botAPI},
+		karakeep:       &Karakeep{ClientWithResponses: tagSrv.client},
+		fileProcessor:  fp,
+		fileValidators: map[string]fileprocessor.Validator{"application/pdf": filevalidator.PDFValidator},
+		maxFilesize:    1024,
+		logger:         logging.New(&config.LoggingConfig{Level: "error", Format: "text", Output: "stderr"}),
+		waitInterval:   0,
+		bgPollInterval: 20 * time.Millisecond,
+		bgPollTimeout:  2 * time.Second,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	kb.handler(ctx, nil, &TelegramUpdate{
+		Message: &models.Message{
+			ID:   43,
+			Chat: models.Chat{ID: 12345, Type: models.ChatTypePrivate},
+			From: &models.User{ID: 7, Username: "tester"},
+			Document: &models.Document{
+				FileID:   "doc-file-id",
+				FileName: "paper.pdf",
+				MimeType: "application/pdf",
+				FileSize: int64(len(testPDF)),
+			},
 		},
+	})
+
+	sentDoc := tg.document()
+	if sentDoc == nil {
+		t.Fatal("expected sendDocument call")
+	}
+	if sentDoc.caption != "#telegram" {
+		t.Errorf("expected initial caption '#telegram' without leading newlines, got %q", sentDoc.caption)
 	}
 
-	newTitle := bookmark.GenerateTitleFromAI(120)
-	if newTitle != "golang, pdf" {
-		t.Fatalf("expected 'golang, pdf', got %q", newTitle)
+	tagSrv.appendAITags("bm-created-1", "research", "pdf")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(tg.edits()) > 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
 
-	if err := kb.karakeep.UpdateBookmarkTitle(context.Background(), bookmark, newTitle); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	edits := tg.edits()
+	if len(edits) != 1 {
+		t.Fatalf("expected 1 editMessageCaption call, got %d (%+v)", len(edits), edits)
 	}
-
-	body, ok := tagSrv.patchCall("bm-title-2")
-	if !ok {
-		t.Fatal("expected a PATCH call to be recorded")
+	if edits[0].isText {
+		t.Errorf("expected editMessageCaption, got %+v", edits[0])
 	}
-	var title string
-	if raw, ok := body["title"]; ok {
-		_ = json.Unmarshal(raw, &title)
-	}
-	if title != "golang, pdf" {
-		t.Errorf("expected title 'golang, pdf', got %q", title)
-	}
-}
-
-// TestEnsureBookmarkTitle_NoTitle verifies ensureBookmarkTitle is a no-op when
-// the bookmark already has a title.
-func TestEnsureBookmarkTitle_NoTitle(t *testing.T) {
-	t.Parallel()
-
-	tagSrv := newTagServer(t)
-	kb := waitForBookmark(t, tagSrv)
-
-	existingTitle := "Existing Title"
-	tagSrv.setBookmarkFull("bm-title-3", "success", "success", ptrString("sum"), &existingTitle, nil)
-
-	bookmark := &KarakeepBookmark{
-		Id:            "bm-title-3",
-		TaggingStatus: ptrStatus("success"),
-		Title:         &existingTitle,
-	}
-
-	// Should be a no-op (no PATCH call).
-	kb.ensureBookmarkTitle(context.Background(), bookmark)
-
-	if _, ok := tagSrv.patchCall("bm-title-3"); ok {
-		t.Error("expected no PATCH call when bookmark already has a title")
-	}
-}
-
-// TestGenerateTitleFromAI_FirstSentence verifies first-sentence extraction and
-// rune-based truncation.
-func TestGenerateTitleFromAI_FirstSentence(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name    string
-		summary string
-		max     int
-		want    string
-	}{
-		{"single sentence", "Hello world.", 120, "Hello world."},
-		{"first of many", "First sentence. Second sentence. Third.", 120, "First sentence."},
-		{"no punctuation", "No punctuation here", 120, "No punctuation here"},
-		{"truncate", "A very long sentence that goes on and on without any punctuation at all to force truncation", 20, "A very long sente..."},
-		{"empty", "", 120, ""},
-		{"question", "Is this right? Yes it is.", 120, "Is this right?"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			bm := KarakeepBookmark{Summary: &tc.summary}
-			got := bm.GenerateTitleFromAI(tc.max)
-			if got != tc.want {
-				t.Errorf("GenerateTitleFromAI(%q, %d) = %q, want %q", tc.summary, tc.max, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestHasTitle verifies HasTitle for nil, empty, and set titles.
-func TestHasTitle(t *testing.T) {
-	t.Parallel()
-
-	if (KarakeepBookmark{}).HasTitle() {
-		t.Error("expected HasTitle=false for nil title")
-	}
-
-	empty := ""
-	if (KarakeepBookmark{Title: &empty}).HasTitle() {
-		t.Error("expected HasTitle=false for empty title")
-	}
-
-	set := "  "
-	if (KarakeepBookmark{Title: &set}).HasTitle() {
-		t.Error("expected HasTitle=false for whitespace-only title")
-	}
-
-	title := "Real Title"
-	if !(KarakeepBookmark{Title: &title}).HasTitle() {
-		t.Error("expected HasTitle=true for set title")
+	if edits[0].caption != "#telegram #research #pdf" {
+		t.Errorf("expected edited caption '#telegram #research #pdf', got %q", edits[0].caption)
 	}
 }

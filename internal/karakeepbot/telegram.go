@@ -23,32 +23,40 @@ type Telegram struct {
 	token secret.String
 }
 
-// createTelegram initializes the Telegram Bot API client.
-func createTelegram(logger *logging.Logger, config *config.TelegramConfig) *Telegram {
-	logger.Debug(fmt.Sprintf("Initializing Telegram Bot API using %s token", config.Token))
-
-	var opts []tgbotapi.Option
-
-	// Configure a custom HTTP client and init timeout. The library default
-	// checkInitTimeout is only 5 seconds, which is too short for getMe in
-	// environments with slow or intermittent internet (e.g. homelabs behind
-	// VPNs). Use 30 seconds for both the HTTP client and the init check.
-	var transport *http.Transport
+// newTelegramHTTPClient creates an HTTP client for the Telegram Bot API.
+// When ProxyEnabled is false, Transport is left nil so http.Client uses
+// http.DefaultTransport (assigning a typed-nil *http.Transport to Transport
+// would cause a nil-pointer dereference).
+func newTelegramHTTPClient(logger *logging.Logger, config *config.TelegramConfig) *http.Client {
+	client := &http.Client{
+		Timeout: 35 * time.Second,
+	}
 	if config.ProxyEnabled {
 		proxyURL, err := url.Parse(config.ProxyURL)
 		if err != nil {
 			logger.Fatal("Error parsing proxy URL.", "error", err)
 		}
-		transport = &http.Transport{
+		client.Transport = &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 		}
 	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
+	return client
+}
+
+// createTelegram initializes the Telegram Bot API client.
+func createTelegram(logger *logging.Logger, config *config.TelegramConfig) *Telegram {
+	logger.Debug(fmt.Sprintf("Initializing Telegram Bot API using %s token", config.Token))
+
+	// Configure a custom HTTP client and init timeout. The library default
+	// checkInitTimeout is only 5 seconds, which is too short for getMe in
+	// environments with slow or intermittent internet (e.g. homelabs behind
+	// VPNs). Use 30 seconds for both the poll timeout and the init check, with
+	// a 35-second HTTP client timeout to allow headroom above long-polling.
+	client := newTelegramHTTPClient(logger, config)
+	opts := []tgbotapi.Option{
+		tgbotapi.WithHTTPClient(30*time.Second, client),
+		tgbotapi.WithCheckInitTimeout(30 * time.Second),
 	}
-	opts = append(opts, tgbotapi.WithHTTPClient(30*time.Second, client))
-	opts = append(opts, tgbotapi.WithCheckInitTimeout(30*time.Second))
 
 	telegramBot, err := tgbotapi.New(config.Token.Value(), opts...)
 	if err != nil {
